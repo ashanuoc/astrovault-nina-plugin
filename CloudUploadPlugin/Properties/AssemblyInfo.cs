@@ -12,8 +12,8 @@ using System.Runtime.InteropServices;
 // MANDATORY: Version information
 // Format: Major.Minor.Patch.Build - increment for each release
 // ============================================================================
-[assembly: AssemblyVersion("0.9.0.0")]
-[assembly: AssemblyFileVersion("0.9.0.0")]
+[assembly: AssemblyVersion("1.0.0.0")]
+[assembly: AssemblyFileVersion("1.0.0.0")]
 
 // ============================================================================
 // MANDATORY: Plugin display information
@@ -44,6 +44,7 @@ using System.Runtime.InteropServices;
 // ============================================================================
 [assembly: AssemblyMetadata("Repository", "https://github.com/ashanuoc/astrovault-nina-plugin")]
 [assembly: AssemblyMetadata("Homepage", "https://vault.astrospherehub.com/")]
+[assembly: AssemblyMetadata("FeaturedImageURL", "https://github.com/ashanuoc/astrovault-nina-plugin/releases/download/1.0.0.0/logo.png")]
 
 // ============================================================================
 // Optional: Tags for plugin discovery in N.I.N.A. plugin manager

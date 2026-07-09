@@ -1,0 +1,55 @@
+# Build outputs
+bin/
+obj/
+[Dd]ebug/
+[Rr]elease/
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# NuGet packages
+packages/
+*.nupkg
+project.lock.json
+project.fragment.lock.json
+artifacts/
+
+# Build results
+*.dll
+*.pdb
+*.exe
+*.cache
+
+# IDE and editor files
+.idea/
+*.resharper
+*.DotSettings.user
+.vscode/
+
+# OS generated files
+Thumbs.db
+ehthumbs.db
+.DS_Store
+Desktop.ini
+
+# Test results
+TestResults/
+[Tt]est[Rr]esult*/
+*.trx
+
+# Rider
+.idea/
+*.sln.iml
+
+# Windows image file caches
+Thumbs.db
+ehthumbs.db
+
+# Backup files
+*~
+*.bak
+*.swp

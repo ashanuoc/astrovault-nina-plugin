@@ -1,0 +1,46 @@
+# Environment and credentials
+.env
+.env.*
+*.env
+!mock-api-server/.env
+!mock-api-server/.env.b2.example
+
+# B2 credentials (Phase 13)
+b2_credentials*
+*b2*.key
+
+# IDE and build artifacts
+.vs/
+bin/
+obj/
+*.user
+*.suo
+
+# Python
+__pycache__/
+*.pyc
+venv/
+
+# OS files
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Test output
+TestResults/
+coverage/
+*.coverage
+
+# Reference repos cloned for audit/research (external — never commit)
+ref_repos/
+
+# Local .NET SDK / toolchain (not part of the project)
+.dotnet/
+.dotnet-home/
+
+# AI agent / tool working dirs
+.claude/
+.codex/
+.gemini/
+.opencode/
+reviewers/

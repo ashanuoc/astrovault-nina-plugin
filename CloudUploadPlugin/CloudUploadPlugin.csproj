@@ -1,0 +1,39 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- Target .NET 8.0 for Windows (matches NINA 3.x) -->
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <OutputType>Library</OutputType>
+    <RootNamespace>Astrovault</RootNamespace>
+    <AssemblyName>Astrovault</AssemblyName>
+
+    <!-- We define assembly info manually in Properties/AssemblyInfo.cs -->
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+
+    <!-- Enable WPF for XAML UI components -->
+    <UseWPF>true</UseWPF>
+    <ImportWindowsDesktopTargets>true</ImportWindowsDesktopTargets>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- NINA Plugin SDK - provides PluginBase, interfaces, mediators -->
+    <PackageReference Include="NINA.Plugin" Version="3.2.0.9001" />
+
+    <!-- JSON serialization for persistent upload queue -->
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+
+    <!-- DPAPI for secure API key storage -->
+    <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="8.0.0" />
+  </ItemGroup>
+
+  <!-- Auto-copy to N.I.N.A. plugins folder after successful build.
+       Plugins subfolder is Plugins\3.0.0\ — confirmed correct for NINA 3.2 (Q3 resolved 2026-06-10):
+       NINA 3.2.0.9001 loads plugins from Plugins\3.0.0\, where other working plugins (Advanced API,
+       Three Point Polar Alignment) also install. The "3.0.0" segment is NINA's plugin-ABI folder, not
+       the app version, so it is unchanged across the 3.0 to 3.2 SDK bump. -->
+  <Target Name="PostBuild" AfterTargets="PostBuildEvent" Condition="'$(GITHUB_ACTIONS)' != 'true'">
+    <Exec Command="if not exist &quot;%25localappdata%25\NINA\Plugins\3.0.0\$(TargetName)&quot; mkdir &quot;%25localappdata%25\NINA\Plugins\3.0.0\$(TargetName)&quot;&#xD;&#xA;xcopy &quot;$(TargetDir)*.*&quot; &quot;%25localappdata%25\NINA\Plugins\3.0.0\$(TargetName)&quot; /h/i/c/k/e/r/y" />
+  </Target>
+
+</Project>

@@ -12,8 +12,8 @@ using System.Runtime.InteropServices;
 // MANDATORY: Version information
 // Format: Major.Minor.Patch.Build - increment for each release
 // ============================================================================
-[assembly: AssemblyVersion("1.0.0.0")]
-[assembly: AssemblyFileVersion("1.0.0.0")]
+[assembly: AssemblyVersion("1.0.1.0")]
+[assembly: AssemblyFileVersion("1.0.1.0")]
 
 // ============================================================================
 // MANDATORY: Plugin display information

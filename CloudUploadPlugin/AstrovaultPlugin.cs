@@ -976,6 +976,17 @@ namespace Astrovault
                     ApiKeyInput = string.Empty;
                     IsApiKeyRevealed = false;
                     Logger.Info("[Astrovault] Connection successful");
+
+                    // Bugfix: DisconnectAsync stops the upload loop (WR-06 key-revocation safety), but the
+                    // reconnect path never restarted it -- so after a Disconnect -> Connect cycle, captured
+                    // images enqueued but never uploaded until a full plugin/NINA reload. Resume draining
+                    // when the loop is not already running (a fresh plugin load already started it in
+                    // StartServices; not-running here is exactly the post-Disconnect reconnect case).
+                    if (uploadManager != null && !uploadManager.IsRunning)
+                    {
+                        await uploadManager.StartAsync(uploadCts?.Token ?? CancellationToken.None);
+                        Logger.Info("[Astrovault] Upload manager restarted after reconnect");
+                    }
                 }
                 else
                 {

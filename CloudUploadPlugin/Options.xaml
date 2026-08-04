@@ -255,10 +255,48 @@
                        Foreground="{StaticResource PrimaryBrush}"
                        Margin="0,20,0,10"/>
 
-            <!-- 8a. WARNING BANNERS (stack all active) -->
+            <!-- 8a. WARNING BANNERS (stack all active). Block banners (storage-quota plan Step 3) come
+                 FIRST: visual precedence over the circuit banner (which uses ShowCircuitOpenBanner,
+                 not IsCircuitOpen directly, so the two can never mislead simultaneously). -->
+
+            <!-- Quota-exceeded block banner + Resume button. Survives restart (the latch is persisted). -->
+            <StackPanel Orientation="Horizontal"
+                        Visibility="{Binding IsQuotaBlocked, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}"
+                        Margin="0,0,0,4">
+                <TextBlock Text="{Binding QuotaBlockedBannerText}"
+                           Foreground="{StaticResource NotificationErrorTextBrush}"
+                           TextWrapping="Wrap"
+                           MaxWidth="380"
+                           VerticalAlignment="Center"/>
+                <Button Click="OnResumeUploadsClicked"
+                        Background="#2E7D32"
+                        Foreground="#FFFFFF"
+                        MinHeight="26"
+                        Margin="10,0,0,0"
+                        VerticalAlignment="Center">
+                    <TextBlock Text="Resume uploads" Margin="10,3"/>
+                </Button>
+            </StackPanel>
+
+            <!-- Auth-invalid block banner. No Resume button here: only a validated key (Test
+                 Connection) can clear this block; the generic Resume button/toggle never do. -->
+            <TextBlock Text="{Binding AuthBlockedBannerText}"
+                       Foreground="{StaticResource NotificationErrorTextBrush}"
+                       TextWrapping="Wrap"
+                       MaxWidth="400"
+                       Visibility="{Binding IsAuthBlocked, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}"
+                       Margin="0,0,0,4"/>
+
+            <!-- Distinct small warning when the latest block transition could not be durably persisted. -->
+            <TextBlock Text="Could not save the stop state to disk"
+                       Foreground="{StaticResource NotificationWarningTextBrush}"
+                       FontSize="11"
+                       Visibility="{Binding HasBlockPersistFailureWarning, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}"
+                       Margin="0,0,0,4"/>
+
             <TextBlock Text="Uploads paused &#x2014; API unreachable"
                        Foreground="{StaticResource NotificationErrorTextBrush}"
-                       Visibility="{Binding IsCircuitOpen, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}"
+                       Visibility="{Binding ShowCircuitOpenBanner, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}"
                        Margin="0,0,0,4"/>
 
             <TextBlock Text="Upload queue exceeds 10GB"
@@ -297,6 +335,15 @@
                                Margin="8,0,0,0"/>
                 </StackPanel>
             </StackPanel>
+
+            <!-- 8b'. QUOTA USAGE LINE (storage-quota plan Step 6), e.g. "12.4 GB of 10.0 GB used
+                 (Pro)". Hidden when no data (never fetched, older server without the endpoint, or
+                 unavailable numbers). Refreshed only on Test-Connection success, queue-idle, and block
+                 transitions; never polled. -->
+            <TextBlock Text="{Binding QuotaUsageText}"
+                       Foreground="{StaticResource PrimaryBrush}"
+                       Visibility="{Binding HasQuotaUsage, Converter={StaticResource BooleanToVisibilityCollapsedConverter}}"
+                       Margin="0,0,0,4"/>
 
             <!-- 8c. QUEUE COUNTS (always visible) -->
             <StackPanel Orientation="Horizontal" Margin="0,4,0,0">

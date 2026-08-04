@@ -132,6 +132,52 @@ namespace CloudUploadPlugin.Tests.Core
             Assert.That(putRequests[1].RequestUri!.PathAndQuery, Does.Contain("/chunks/4"));
         }
 
+        /// <summary>
+        /// Storage-quota plan §4 step-7 row 17 / §8: "a chunked resume after a NINA restart is
+        /// re-checked at complete" is a backend-confirmed EXPECTED path (usage can change while
+        /// NINA is closed). Simulates a job reloaded from the persisted queue with every chunk
+        /// already sent (exactly <see cref="TestDataFactory.CreateResumeUploadJob"/>'s shape, as
+        /// it would be after a NINA restart) -- so UploadFileAsync must go straight from the
+        /// resume-status check to complete, WITHOUT re-uploading any chunk, and classify a 507 at
+        /// complete cleanly rather than a raw/opaque failure.
+        /// </summary>
+        [Test]
+        public async Task Resume_AllChunksAlreadySent_507AtComplete_LatchesCleanlyNoReupload()
+        {
+            long fileSize = 15 * 1024 * 1024; // 3 chunks
+            var filePath = CreateTempFile(fileSize);
+            var job = TestDataFactory.CreateResumeUploadJob(
+                uploadSessionId: "sess-resume-507",
+                chunksSent: new List<int> { 0, 1, 2 },
+                totalChunks: 3,
+                fileSize: fileSize);
+            job.LocalPath = filePath;
+
+            // Resume-status: server confirms all 3 chunks already received.
+            mockHandler.Enqueue(new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(
+                    JsonConvert.SerializeObject(new { uploadId = "sess-resume-507", status = "in_progress", receivedChunks = new[] { 0, 1, 2 }, totalChunks = 3, expiresAt = "2026-12-31T23:59:59Z" }),
+                    Encoding.UTF8, "application/json")
+            });
+
+            // Complete: usage changed while NINA was closed -- now over quota.
+            mockHandler.Enqueue(new HttpResponseMessage((HttpStatusCode)507)
+            {
+                Content = new StringContent("{\"error\":{\"code\":\"quota.exceeded\"}}", Encoding.UTF8, "application/json")
+            });
+
+            var result = await sut.UploadFileAsync(job, null, CancellationToken.None);
+
+            Assert.That(result.Success, Is.False);
+            Assert.That(result.FailureKind, Is.EqualTo(FailureKind.PermanentQuota));
+            Assert.That(result.StatusCode, Is.EqualTo(507));
+            // Exactly 2 requests: the resume-status check + complete -- no chunk was re-uploaded.
+            Assert.That(mockHandler.Requests.Count, Is.EqualTo(2));
+            Assert.That(mockHandler.Requests.Any(r => r.Method == HttpMethod.Put), Is.False,
+                "No chunk PUT -- all chunks were already confirmed received by the resume-status check");
+        }
+
         [Test]
         public async Task Resume_ExpiredSession_StartsNewSession()
         {
@@ -563,6 +609,138 @@ namespace CloudUploadPlugin.Tests.Core
             Assert.That(job.TotalChunks, Is.EqualTo(3));
             // First request is the fresh initiate (no status call against the stale session).
             Assert.That(mockHandler.Requests[0].RequestUri!.PathAndQuery, Does.Contain("uploads/initiate"));
+        }
+
+        // ====================================================================
+        // G9/G4 fix: resume-status route (uploads/{id}/status) joins the classifier.
+        // Previously any non-404/410 response body was deserialized as if it were a
+        // success-shaped UploadStatusResponse, regardless of whether the request actually
+        // succeeded. 401/403/507 (and a malformed body on one of those statuses) must now be
+        // classified and surfaced directly -- never mistaken for status-shaped data. 404/410
+        // keep their existing session-expiry semantics (proven by the tests above).
+        // ====================================================================
+
+        [TestCase(401, FailureKind.PermanentAuth, false)]
+        [TestCase(403, FailureKind.PermanentAuth, false)]
+        [TestCase(507, FailureKind.PermanentQuota, false)]
+        public async Task ResumeStatus_ClassifiesNonSuccessStatus_NeverParsedAsStatusBody(int statusCode, FailureKind expectedKind, bool expectedIsPermanent)
+        {
+            long fileSize = 10 * 1024 * 1024; // 2 chunks
+            var filePath = CreateTempFile(fileSize);
+            var job = TestDataFactory.CreateResumeUploadJob(
+                uploadSessionId: "sess-resume-cls",
+                chunksSent: new List<int> { 0 },
+                totalChunks: 2,
+                fileSize: fileSize);
+            job.LocalPath = filePath;
+
+            // A body shaped like a plausible status/quota payload -- must be classified by STATUS,
+            // never deserialized as if the request had actually succeeded.
+            mockHandler.Enqueue(new HttpResponseMessage((HttpStatusCode)statusCode)
+            {
+                Content = new StringContent("{\"receivedChunks\":[0,1],\"usedBytes\":5,\"limitBytes\":10}", Encoding.UTF8, "application/json")
+            });
+
+            var result = await sut.UploadFileAsync(job, null, CancellationToken.None);
+
+            Assert.That(result.Success, Is.False);
+            Assert.That(result.StatusCode, Is.EqualTo(statusCode));
+            Assert.That(result.FailureKind, Is.EqualTo(expectedKind));
+            Assert.That(result.IsPermanent, Is.EqualTo(expectedIsPermanent));
+            // No chunk/complete requests followed -- the classified failure short-circuits the resume flow.
+            Assert.That(mockHandler.Requests.Count, Is.EqualTo(1));
+        }
+
+        [Test]
+        public async Task ResumeStatus_507_AttachesValidatedQuotaInfo()
+        {
+            long fileSize = 10 * 1024 * 1024;
+            var filePath = CreateTempFile(fileSize);
+            var job = TestDataFactory.CreateResumeUploadJob(
+                uploadSessionId: "sess-resume-quota",
+                chunksSent: new List<int> { 0 },
+                totalChunks: 2,
+                fileSize: fileSize);
+            job.LocalPath = filePath;
+
+            mockHandler.Enqueue(new HttpResponseMessage(HttpStatusCode.InsufficientStorage)
+            {
+                Content = new StringContent("{\"usedBytes\":17179869184,\"limitBytes\":10737418240,\"remainingBytes\":0}", Encoding.UTF8, "application/json")
+            });
+
+            var result = await sut.UploadFileAsync(job, null, CancellationToken.None);
+
+            Assert.That(result.FailureKind, Is.EqualTo(FailureKind.PermanentQuota));
+            Assert.That(result.QuotaInfo, Is.Not.Null);
+            Assert.That(result.QuotaInfo.UsedBytes, Is.EqualTo(17179869184));
+            Assert.That(result.QuotaInfo.LimitBytes, Is.EqualTo(10737418240));
+        }
+
+        [Test]
+        public async Task ResumeStatus_MalformedBodyOnClassifiedFailure_StillClassifies()
+        {
+            // A 507 whose body is not valid JSON at all must still classify by STATUS -- the quota
+            // body parse failure must never fault the classification itself.
+            long fileSize = 10 * 1024 * 1024;
+            var filePath = CreateTempFile(fileSize);
+            var job = TestDataFactory.CreateResumeUploadJob(
+                uploadSessionId: "sess-resume-malformed",
+                chunksSent: new List<int> { 0 },
+                totalChunks: 2,
+                fileSize: fileSize);
+            job.LocalPath = filePath;
+
+            mockHandler.Enqueue(new HttpResponseMessage(HttpStatusCode.InsufficientStorage)
+            {
+                Content = new StringContent("<html>not json</html>")
+            });
+
+            var result = await sut.UploadFileAsync(job, null, CancellationToken.None);
+
+            Assert.That(result.Success, Is.False);
+            Assert.That(result.FailureKind, Is.EqualTo(FailureKind.PermanentQuota));
+            Assert.That(result.QuotaInfo, Is.Null, "an unparseable body must leave QuotaInfo unavailable, not fault the request");
+        }
+
+        [Test]
+        public async Task ResumeStatus_404And410_StillMeanSessionExpiry_Unaffected()
+        {
+            // Regression: 404/410 on the resume-status route must keep restarting the session --
+            // the classifier must never see these two codes (they are intercepted first).
+            long fileSize = 10 * 1024 * 1024; // 2 chunks
+            var filePath = CreateTempFile(fileSize);
+            var job = TestDataFactory.CreateResumeUploadJob(
+                uploadSessionId: "sess-resume-404",
+                chunksSent: new List<int> { 0 },
+                totalChunks: 2,
+                fileSize: fileSize);
+            job.LocalPath = filePath;
+            job.SessionRestartCount = 0;
+
+            mockHandler.Enqueue(new HttpResponseMessage(HttpStatusCode.NotFound)
+            {
+                Content = new StringContent("{\"error\":{\"code\":\"upload.not_found\"}}")
+            });
+            mockHandler.Enqueue(new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(JsonConvert.SerializeObject(new { uploadId = "sess-resume-404-fresh", chunkSize = 5242880, totalChunks = 2, expiresAt = "2026-12-31T23:59:59Z" }), Encoding.UTF8, "application/json")
+            });
+            for (int i = 0; i < 2; i++)
+            {
+                mockHandler.Enqueue(new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent(JsonConvert.SerializeObject(new { chunkIndex = i, received = true }), Encoding.UTF8, "application/json")
+                });
+            }
+            mockHandler.Enqueue(new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(JsonConvert.SerializeObject(new { remoteUrl = "https://cdn.test.io/file.fits", remotePath = "test", fileSize }), Encoding.UTF8, "application/json")
+            });
+
+            var result = await sut.UploadFileAsync(job, null, CancellationToken.None);
+
+            Assert.That(result.Success, Is.True);
+            Assert.That(job.SessionRestartCount, Is.EqualTo(1));
         }
 
         // ====================================================================

@@ -218,6 +218,26 @@ namespace Astrovault
         }
 
         /// <summary>
+        /// Handles the "Resume uploads" button click (storage-quota plan §4 Step 3/5). Visible only
+        /// while <c>IsQuotaBlocked</c> -- <c>ResumeUploadsAsync</c> is itself kind-gated (a no-op for
+        /// AuthInvalid/unblocked), matching the existing async-void + try/catch UI-handler convention
+        /// (mirrors <see cref="OnDisconnectClicked"/>).
+        /// </summary>
+        private async void OnResumeUploadsClicked(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                if (sender is not Button button || button.DataContext is not AstrovaultPlugin plugin)
+                    return;
+                await plugin.ResumeUploadsAsync();
+            }
+            catch (System.Exception ex)
+            {
+                NINA.Core.Utility.Notification.Notification.ShowError($"Resume uploads failed: {ex.Message}");
+            }
+        }
+
+        /// <summary>
         /// Handles the "Reset Counts" button click.
         /// Zeroes the historical counters (Total uploaded + Failed); does not delete files or affect
         /// pending / in-progress uploads.

@@ -34,5 +34,19 @@ namespace Astrovault.Interfaces
         /// Gets the base URL of the configured API endpoint.
         /// </summary>
         string BaseUrl { get; }
+
+        /// <summary>
+        /// Storage-quota plan §4 Step 6: fetches the account's current storage usage from
+        /// <c>GET v1/storage/nina/quota</c> (endpoint contract confirmed by backend §8). No caching --
+        /// callers control the refresh cadence (Test-Connection success, queue transitioning to idle,
+        /// block transitions -- NO polling/timers). Bounded by a short per-call timeout.
+        /// <para>
+        /// Returns null -- never throws -- when the usage is unavailable for ANY reason: no API key,
+        /// the HTTPS send-boundary gate rejects the endpoint, a 404 (older server predating this
+        /// endpoint -- NOT an error; hide the usage line silently, no toast, no log spam beyond debug),
+        /// any other non-2xx status, a malformed/unparseable body, or a timeout/network fault.
+        /// </para>
+        /// </summary>
+        Task<QuotaUsage> GetQuotaAsync(CancellationToken cancellationToken);
     }
 }

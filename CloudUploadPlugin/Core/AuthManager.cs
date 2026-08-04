@@ -112,6 +112,7 @@ namespace Astrovault.Core
             {
                 using var request = new HttpRequestMessage(HttpMethod.Get, "v1/storage/nina/auth/validate");
                 request.Headers.Add("X-API-Key", apiKey);
+                request.Headers.Add(PluginVersionHeader.HeaderName, PluginVersionHeader.Value);
 
                 var response = await httpClient.SendAsync(request, cts.Token).ConfigureAwait(false);
 
@@ -135,7 +136,15 @@ namespace Astrovault.Core
                     // SC6: never log the raw account/observatory name (NINA logs are shared in public
                     // support channels). MaskAccountName keeps support-correlatable shape only.
                     Logger.Info($"[AuthManager] Validation successful for account: {LogSanitizer.MaskAccountName(result.AccountName)}");
-                    return ApiKeyValidationResult.Success(result.AccountName);
+                    // Contract-delta round item 2: accountId is an opaque identifier, not display text --
+                    // logged at Debug only (never Info/Warning/Error) and never beyond this log line; it
+                    // is threaded to the caller for the generation-checked SetAccountIdAsync path, not
+                    // persisted here.
+                    if (!string.IsNullOrEmpty(result.AccountId))
+                    {
+                        Logger.Debug($"[AuthManager] Validation response included accountId: {result.AccountId}");
+                    }
+                    return ApiKeyValidationResult.Success(result.AccountName, result.AccountId);
                 }
 
                 Logger.Warning("[AuthManager] Validation response: key not valid");
@@ -372,12 +381,15 @@ namespace Astrovault.Core
 
         /// <summary>
         /// Response model for the validation endpoint.
-        /// Expected: { valid: true/false, accountName: "..." }
+        /// Expected: { valid: true/false, accountName: "...", accountId: "..." }
+        /// <c>accountId</c> is optional (contract-delta round item 2) -- an older backend that omits
+        /// it deserializes to null here, tolerated by every downstream consumer.
         /// </summary>
         private class ValidationResponse
         {
             public bool Valid { get; set; }
             public string AccountName { get; set; }
+            public string AccountId { get; set; }
         }
 
         public void Dispose()

@@ -488,13 +488,16 @@ namespace CloudUploadPlugin.Tests.Core
         }
 
         /// <summary>
-        /// REL-04 boundary: when the OUTER cancellation token IS requested, a chunk
-        /// TaskCanceledException is NOT treated as a transient transport fault — it
-        /// propagates as a clean cancellation (UploadFileAsync returns the cancel result).
+        /// REL-04 boundary / storage-quota plan directive D (cancellation honesty): when the OUTER
+        /// cancellation token IS requested, a chunk TaskCanceledException is NOT treated as a
+        /// transient transport fault — it propagates as a real OperationCanceledException out of
+        /// UploadFileAsync (rather than being fabricated into a transient failed UploadResult), so
+        /// UploadManager's existing clean-cancel catch can handle it without feeding the breaker or
+        /// consuming a retry.
         /// </summary>
         [Test]
         [Category("Resilience")]
-        public async Task Resilience_OuterCancellation_NotTreatedAsTransientFault()
+        public void Resilience_OuterCancellation_NotTreatedAsTransientFault()
         {
             var filePath = CreateTempFile(5 * 1024 * 1024);
             var job = TestDataFactory.CreateChunkedUploadJob(localPath: filePath, fileSize: 5 * 1024 * 1024);
@@ -508,9 +511,8 @@ namespace CloudUploadPlugin.Tests.Core
             using var cts = new CancellationTokenSource();
             cts.CancelAfter(TimeSpan.FromMilliseconds(150));
 
-            var result = await sut.UploadFileAsync(job, null, cts.Token);
-
-            Assert.That(result.Success, Is.False, "user cancellation should not be retried");
+            Assert.ThrowsAsync<OperationCanceledException>(async () => await sut.UploadFileAsync(job, null, cts.Token),
+                "a real caller-token cancellation must propagate, not be fabricated into a transient UploadResult");
             // initiate + the single stalled chunk attempt; the retry response is never used.
             Assert.That(mockHandler.Requests.Count, Is.EqualTo(2),
                 "outer cancellation must not trigger a per-chunk retry");
@@ -688,6 +690,165 @@ namespace CloudUploadPlugin.Tests.Core
 
             Assert.That(result.Success, Is.False, "a complete with an empty URL must not be a success");
             Assert.That(result.IsPermanent, Is.False, "empty-URL complete is transient (retryable)");
+        }
+
+        // ====================================================================
+        // Retry-after-complete addendum: 409 on the COMPLETE route only. The BFF has a 300s
+        // downstream timeout on assemble+push-to-B2; a large complete can exceed it, so OUR OWN
+        // retry of `complete` can arrive after the original attempt already finished server-side.
+        // A 409 upload.already_complete means the file LANDED -- must be treated as success, never
+        // retried/re-queued (that would duplicate the upload + double-charge quota). Every other
+        // 409 shape (different code, unparseable body, flat body) keeps today's Transient behavior.
+        // ====================================================================
+
+        /// <summary>
+        /// The one 409 shape that IS a success: exact-match `upload.already_complete` in the nested
+        /// §4 envelope. The 409 body carries no remoteUrl/remotePath, so the built success result
+        /// must tolerate a null RemoteUrl (mirrors the parallel-chunk success path's own
+        /// UploadResult.Ok(null)) -- see UploadManagerQueueTests for the downstream-safety proof.
+        /// </summary>
+        [Test]
+        [Category("ChunkedUpload")]
+        public async Task CompleteUpload_409AlreadyComplete_TreatedAsSuccess()
+        {
+            var filePath = CreateTempFile(5 * 1024 * 1024);
+            var job = TestDataFactory.CreateChunkedUploadJob(localPath: filePath, fileSize: 5 * 1024 * 1024);
+
+            mockHandler.Enqueue(OkJson(new { uploadId = "sess-already", chunkSize = 5242880, totalChunks = 1, expiresAt = "2026-12-31T23:59:59Z" }));
+            mockHandler.Enqueue(OkJson(new { chunkIndex = 0, received = true }));
+            mockHandler.Enqueue(new HttpResponseMessage(HttpStatusCode.Conflict)
+            {
+                Content = new StringContent(
+                    "{\"error\":{\"code\":\"upload.already_complete\",\"message\":\"Upload session has already been completed\",\"details\":{\"uploadId\":\"sess-already\"}}}",
+                    Encoding.UTF8, "application/json")
+            });
+
+            var result = await sut.UploadFileAsync(job, null, CancellationToken.None);
+
+            Assert.That(result.Success, Is.True, "a 409 upload.already_complete must be treated as success -- the file landed server-side");
+            Assert.That(result.RemoteUrl, Is.Null, "the 409 body carries no remoteUrl -- the success result must tolerate its absence");
+            Assert.That(mockHandler.Requests.Count(r => r.RequestUri.PathAndQuery.Contains("/complete")), Is.EqualTo(1),
+                "exactly one complete attempt -- no retry/re-POST once the 409 is recognized as success");
+        }
+
+        [Test]
+        [Category("ChunkedUpload")]
+        public async Task CompleteUpload_409DifferentCode_StaysTransient()
+        {
+            var filePath = CreateTempFile(5 * 1024 * 1024);
+            var job = TestDataFactory.CreateChunkedUploadJob(localPath: filePath, fileSize: 5 * 1024 * 1024);
+
+            mockHandler.Enqueue(OkJson(new { uploadId = "sess-diffcode", chunkSize = 5242880, totalChunks = 1, expiresAt = "2026-12-31T23:59:59Z" }));
+            mockHandler.Enqueue(OkJson(new { chunkIndex = 0, received = true }));
+            mockHandler.Enqueue(new HttpResponseMessage(HttpStatusCode.Conflict)
+            {
+                Content = new StringContent(
+                    "{\"error\":{\"code\":\"upload.chunk_hash_mismatch\",\"message\":\"nope\",\"details\":{}}}",
+                    Encoding.UTF8, "application/json")
+            });
+
+            var result = await sut.UploadFileAsync(job, null, CancellationToken.None);
+
+            Assert.That(result.Success, Is.False, "only an EXACT upload.already_complete match may short-circuit to success");
+            Assert.That(result.FailureKind, Is.EqualTo(FailureKind.Transient));
+            Assert.That(result.StatusCode, Is.EqualTo(409));
+        }
+
+        [Test]
+        [Category("ChunkedUpload")]
+        public async Task CompleteUpload_409MalformedBody_StaysTransient()
+        {
+            var filePath = CreateTempFile(5 * 1024 * 1024);
+            var job = TestDataFactory.CreateChunkedUploadJob(localPath: filePath, fileSize: 5 * 1024 * 1024);
+
+            mockHandler.Enqueue(OkJson(new { uploadId = "sess-malformed", chunkSize = 5242880, totalChunks = 1, expiresAt = "2026-12-31T23:59:59Z" }));
+            mockHandler.Enqueue(OkJson(new { chunkIndex = 0, received = true }));
+            mockHandler.Enqueue(new HttpResponseMessage(HttpStatusCode.Conflict)
+            {
+                Content = new StringContent("{not valid json", Encoding.UTF8, "application/json")
+            });
+
+            var result = await sut.UploadFileAsync(job, null, CancellationToken.None);
+
+            Assert.That(result.Success, Is.False, "an unparseable 409 body must never be silently marked successful");
+            Assert.That(result.FailureKind, Is.EqualTo(FailureKind.Transient));
+        }
+
+        [Test]
+        [Category("ChunkedUpload")]
+        public async Task CompleteUpload_409FlatBodyShaped_StaysTransient()
+        {
+            var filePath = CreateTempFile(5 * 1024 * 1024);
+            var job = TestDataFactory.CreateChunkedUploadJob(localPath: filePath, fileSize: 5 * 1024 * 1024);
+
+            mockHandler.Enqueue(OkJson(new { uploadId = "sess-flat", chunkSize = 5242880, totalChunks = 1, expiresAt = "2026-12-31T23:59:59Z" }));
+            mockHandler.Enqueue(OkJson(new { chunkIndex = 0, received = true }));
+            // Flat (non-envelope) body: `error` is a plain string, not the nested §4 object shape.
+            mockHandler.Enqueue(new HttpResponseMessage(HttpStatusCode.Conflict)
+            {
+                Content = new StringContent("{\"error\":\"already_complete\",\"uploadId\":\"sess-flat\"}", Encoding.UTF8, "application/json")
+            });
+
+            var result = await sut.UploadFileAsync(job, null, CancellationToken.None);
+
+            Assert.That(result.Success, Is.False, "a flat/non-envelope 409 body must never be silently marked successful");
+            Assert.That(result.FailureKind, Is.EqualTo(FailureKind.Transient));
+        }
+
+        /// <summary>
+        /// Regression pin: a 503 upload.completion_in_progress at complete (the "winner still
+        /// working" branch of the retry-after-complete race, after a 30s server-side lock wait) must
+        /// stay Transient -- FailureClassifier already treats 503 as transient by default; this pins
+        /// that behavior so a future change to the classifier can't silently break this race's
+        /// retry path.
+        /// </summary>
+        [Test]
+        [Category("ChunkedUpload")]
+        public async Task CompleteUpload_503CompletionInProgress_StaysTransientWithBackoff()
+        {
+            var filePath = CreateTempFile(5 * 1024 * 1024);
+            var job = TestDataFactory.CreateChunkedUploadJob(localPath: filePath, fileSize: 5 * 1024 * 1024);
+
+            mockHandler.Enqueue(OkJson(new { uploadId = "sess-inprogress", chunkSize = 5242880, totalChunks = 1, expiresAt = "2026-12-31T23:59:59Z" }));
+            mockHandler.Enqueue(OkJson(new { chunkIndex = 0, received = true }));
+            mockHandler.Enqueue(new HttpResponseMessage(HttpStatusCode.ServiceUnavailable)
+            {
+                Content = new StringContent(
+                    "{\"error\":{\"code\":\"upload.completion_in_progress\",\"message\":\"Another attempt is completing this upload\",\"details\":{}}}",
+                    Encoding.UTF8, "application/json")
+            });
+
+            var result = await sut.UploadFileAsync(job, null, CancellationToken.None);
+
+            Assert.That(result.Success, Is.False);
+            Assert.That(result.FailureKind, Is.EqualTo(FailureKind.Transient), "503 completion_in_progress must stay retryable (manager applies its own backoff)");
+            Assert.That(result.StatusCode, Is.EqualTo(503));
+        }
+
+        /// <summary>
+        /// Route-specific guard: the already-complete short-circuit lives ONLY in
+        /// CompleteUploadAsync's 409 handling. Even if a 409 on INITIATE carried the exact same
+        /// envelope/code, it must stay Transient like today -- proving the parser is not wired into
+        /// any other route.
+        /// </summary>
+        [Test]
+        [Category("ChunkedUpload")]
+        public async Task InitiateUpload_409WithAlreadyCompleteBody_NotShortCircuited_StaysTransient()
+        {
+            var filePath = CreateTempFile(5 * 1024 * 1024);
+            var job = TestDataFactory.CreateChunkedUploadJob(localPath: filePath, fileSize: 5 * 1024 * 1024);
+
+            mockHandler.Enqueue(new HttpResponseMessage(HttpStatusCode.Conflict)
+            {
+                Content = new StringContent(
+                    "{\"error\":{\"code\":\"upload.already_complete\",\"message\":\"irrelevant on this route\",\"details\":{}}}",
+                    Encoding.UTF8, "application/json")
+            });
+
+            var result = await sut.UploadFileAsync(job, null, CancellationToken.None);
+
+            Assert.That(result.Success, Is.False, "initiate's 409 must never be short-circuited to success");
+            Assert.That(result.FailureKind, Is.EqualTo(FailureKind.Transient));
         }
 
         /// <summary>
@@ -897,14 +1058,16 @@ namespace CloudUploadPlugin.Tests.Core
         /// <summary>
         /// CR-03 regression: a 410 on one chunk triggers a group-cancel/restart while siblings are in
         /// flight, and the OUTER token is cancelled DURING the drain of that group cancel. The outcome
-        /// must be deterministic: outer cancellation wins (clean cancel, surfaced as a failed result by
-        /// UploadFileAsync), no exception escapes, the job is left resumable (SessionRestartCount NOT
-        /// incremented because the pending restart is intentionally abandoned for this run), and the
-        /// LastObservedMaxInFlight observability seam is still assigned.
+        /// must be deterministic: outer cancellation wins (a clean cancellation that propagates as
+        /// OperationCanceledException out of UploadFileAsync -- storage-quota plan directive D: a real
+        /// caller-token cancel is rethrown, never fabricated into a failed UploadResult), the job is
+        /// left resumable (SessionRestartCount NOT incremented because the pending restart is
+        /// intentionally abandoned for this run), and the LastObservedMaxInFlight observability seam is
+        /// still assigned.
         /// </summary>
         [Test]
         [Category("ParallelChunk")]
-        public async Task ParallelChunk_OuterCancelDuringGroupCancelDrain_DeterministicOuterCancel()
+        public void ParallelChunk_OuterCancelDuringGroupCancelDrain_DeterministicOuterCancel()
         {
             long fileSize = 20L * 1024 * 1024; // 4 chunks
             var filePath = CreateTempFile(fileSize);
@@ -935,17 +1098,256 @@ namespace CloudUploadPlugin.Tests.Core
             // If the restart path were (incorrectly) taken it would need a fresh initiate; we do NOT
             // enqueue one. Outer-cancel must win deterministically instead.
 
-            var result = await sut.UploadFileAsync(job, null, cts.Token);
-
-            // Outer cancellation wins deterministically: surfaced as a (non-permanent) failed result.
-            Assert.That(result.Success, Is.False, "outer cancel during the drain must yield a cancelled result");
-            Assert.That(result.IsPermanent, Is.False, "a user/shutdown cancel is never a permanent failure");
+            // Outer cancellation wins deterministically: propagates as OperationCanceledException.
+            Assert.ThrowsAsync<OperationCanceledException>(async () => await sut.UploadFileAsync(job, null, cts.Token),
+                "outer cancel during the drain must propagate as a real cancellation, not a fabricated failed result");
             // The pending session-restart is abandoned for this run -> count NOT incremented.
             Assert.That(job.SessionRestartCount, Is.EqualTo(0),
                 "outer cancel must abandon (not consume) the pending session restart");
             // Observability seam assigned on the outer-cancel exit path.
             Assert.That(sut.LastObservedMaxInFlight, Is.GreaterThanOrEqualTo(1),
                 "LastObservedMaxInFlight must be set on the outer-cancel exit path");
+        }
+
+        /// <summary>
+        /// Storage-quota plan §4 Step 1 / step-7 row 1: a clean (non-racing) mid-flight 507 --
+        /// only ONE chunk fails; the others are merely slow, not competing failures. Unlike the
+        /// precedence-race tests below (which pit two DIFFERENT failure kinds against each other),
+        /// this test has no competing failure, so the outcome is deterministic on every run --
+        /// exactly like <see cref="ParallelChunk_410MidFlight_DrainsSiblingsThenRestarts"/>
+        /// above, which uses the same "one fast failure, several slow successes" shape. Closes
+        /// the plan's row-1 requirement ("in-flight sibling chunks canceled and drained") with a
+        /// test that needs no retry tolerance.
+        /// </summary>
+        [Test]
+        [Category("ParallelChunk")]
+        public async Task ParallelChunk_507MidFlight_DrainsSiblingsThenLatchesQuota()
+        {
+            long fileSize = 20L * 1024 * 1024; // 4 chunks
+            var filePath = CreateTempFile(fileSize);
+            var job = TestDataFactory.CreateChunkedUploadJob(localPath: filePath, fileSize: fileSize);
+            sut.ChunkConcurrencyOverride = 4;
+
+            mockHandler.UseIndexedRouting = true;
+            mockHandler.EnqueueInitiate("sess-507-midflight", totalChunks: 4);
+            mockHandler.EnqueueChunkOk(0, delayMs: 200); // slow -- drained into cancellation
+            EnqueueChunkStatus(mockHandler, 1, HttpStatusCode.InsufficientStorage, delayMs: 5); // fails first
+            mockHandler.EnqueueChunkOk(2, delayMs: 200); // slow -- drained into cancellation
+            mockHandler.EnqueueChunkOk(3, delayMs: 200); // slow -- drained into cancellation
+            // No complete/restart response enqueued: the group must never reach either.
+
+            var result = await sut.UploadFileAsync(job, null, CancellationToken.None);
+
+            Assert.That(result.Success, Is.False);
+            Assert.That(result.FailureKind, Is.EqualTo(FailureKind.PermanentQuota));
+            Assert.That(result.StatusCode, Is.EqualTo(507));
+            // Every chunk was genuinely dispatched (reached the mock) before the group cancelled --
+            // proving the siblings were in flight, not skipped, when they got cancelled/drained.
+            Assert.That(mockHandler.Requests.Count(r => r.RequestUri!.PathAndQuery.Contains("/chunks/0")), Is.EqualTo(1));
+            Assert.That(mockHandler.Requests.Count(r => r.RequestUri!.PathAndQuery.Contains("/chunks/1")), Is.EqualTo(1));
+            Assert.That(mockHandler.Requests.Count(r => r.RequestUri!.PathAndQuery.Contains("/chunks/2")), Is.EqualTo(1));
+            Assert.That(mockHandler.Requests.Count(r => r.RequestUri!.PathAndQuery.Contains("/chunks/3")), Is.EqualTo(1));
+            Assert.That(mockHandler.Requests.Count(r => r.RequestUri!.PathAndQuery.Contains("/complete")), Is.EqualTo(0));
+            Assert.That(mockHandler.Requests.Count(r => r.RequestUri!.PathAndQuery.Contains("/initiate")), Is.EqualTo(1));
+        }
+
+        // ====================================================================
+        // Storage-quota plan §4 Step 1: chunk-group TOTAL precedence
+        //   PermanentAuth > PermanentQuota > 410-session-expiry > everything else
+        // Auth/quota chunk failures must cancel the shared token, drain in-flight siblings, and
+        // NEVER trigger the existing 410 session-restart recursion.
+        // ====================================================================
+
+        /// <summary>Enqueues a per-index chunk response with an arbitrary status + JSON body.</summary>
+        private static void EnqueueChunkStatus(MockHttpMessageHandler handler, int chunkIndex, HttpStatusCode status, string body = "{}", int delayMs = 0)
+        {
+            handler.EnqueueChunkCustom(chunkIndex, async ct =>
+            {
+                if (delayMs > 0) await Task.Delay(delayMs, ct).ConfigureAwait(false);
+                return new HttpResponseMessage(status)
+                {
+                    Content = new StringContent(body, Encoding.UTF8, "application/json")
+                };
+            });
+        }
+
+        /// <summary>
+        /// N-party rendezvous barrier used by the precedence-race tests below. Each competing
+        /// chunk's mock step calls <see cref="ArriveAndWaitAsync"/> BEFORE constructing its
+        /// response; the wait only completes once every party has arrived, and it observes NO
+        /// cancellation token -- so once all parties have proven they were genuinely dispatched
+        /// (reached the mock handler), release is guaranteed regardless of the group's
+        /// cancellation state. This replaces wall-clock delay separation (e.g. "give chunk A 5ms,
+        /// chunk B 5ms"), which was empirically flaky under load: whichever chunk's round trip
+        /// happened to finish first would cancel the shared token and could silently drop the
+        /// OTHER chunk's request before it ever reached the mock -- not exercising the precedence
+        /// logic at all, just "whichever one didn't get cancelled first wins".
+        /// </summary>
+        private sealed class Rendezvous
+        {
+            private readonly TaskCompletionSource<bool> gate =
+                new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            private readonly int parties;
+            private int arrived;
+
+            public Rendezvous(int parties) { this.parties = parties; }
+
+            public async Task ArriveAndWaitAsync()
+            {
+                if (Interlocked.Increment(ref arrived) == parties)
+                {
+                    gate.TrySetResult(true);
+                }
+                await gate.Task.ConfigureAwait(false);
+            }
+        }
+
+        /// <summary>
+        /// 401 (auth) + 507 (quota) racing at concurrency 4: auth wins (highest precedence) --
+        /// credentials are a prerequisite, so a revoked key must never be reported as "storage full".
+        /// A rendezvous proves BOTH chunks were genuinely dispatched before either resolves.
+        /// Deterministic (no [Retry]): storage-quota plan directive A fixed the underlying chunk-group
+        /// race -- once a chunk's SendAsync is dispatched, it is linked ONLY to the real outer
+        /// lifecycle token + the per-attempt timeout, never the group-stop token, so a sibling's
+        /// group-cancel can no longer tear down this already-in-flight request before its response is
+        /// drained and classified. Both responses are always fully classified into their own
+        /// precedence slot; the final precedence check picks the winner deterministically regardless
+        /// of arrival order.
+        /// </summary>
+        [Test]
+        [Category("ParallelChunk")]
+        public async Task ParallelChunk_AuthAndQuotaRace_AuthWins()
+        {
+            long fileSize = 20L * 1024 * 1024; // 4 chunks
+            var filePath = CreateTempFile(fileSize);
+            var job = TestDataFactory.CreateChunkedUploadJob(localPath: filePath, fileSize: fileSize);
+            sut.ChunkConcurrencyOverride = 4;
+
+            var rendezvous = new Rendezvous(2);
+            mockHandler.UseIndexedRouting = true;
+            mockHandler.EnqueueInitiate("sess-auth-quota", totalChunks: 4);
+            mockHandler.EnqueueChunkCustom(0, async _ =>
+            {
+                await rendezvous.ArriveAndWaitAsync();
+                return new HttpResponseMessage(HttpStatusCode.Unauthorized)
+                {
+                    Content = new StringContent("{}", Encoding.UTF8, "application/json")
+                };
+            });
+            mockHandler.EnqueueChunkCustom(1, async _ =>
+            {
+                await rendezvous.ArriveAndWaitAsync();
+                return new HttpResponseMessage(HttpStatusCode.InsufficientStorage)
+                {
+                    Content = new StringContent("{}", Encoding.UTF8, "application/json")
+                };
+            });
+            mockHandler.EnqueueChunkOk(2, delayMs: 300); // slow -- drained into cancellation
+            mockHandler.EnqueueChunkOk(3, delayMs: 300); // slow -- drained into cancellation
+            // No restart / complete responses enqueued: the group must never reach either.
+
+            var result = await sut.UploadFileAsync(job, null, CancellationToken.None);
+
+            Assert.That(result.Success, Is.False);
+            Assert.That(result.FailureKind, Is.EqualTo(FailureKind.PermanentAuth), "auth must win over a concurrent quota failure");
+            Assert.That(result.StatusCode, Is.EqualTo(401));
+            // Both requests genuinely reached the server -- this was a real race, not one dropping
+            // out before the other was even dispatched.
+            Assert.That(mockHandler.Requests.Count(r => r.RequestUri!.PathAndQuery.Contains("/chunks/0")), Is.EqualTo(1));
+            Assert.That(mockHandler.Requests.Count(r => r.RequestUri!.PathAndQuery.Contains("/chunks/1")), Is.EqualTo(1));
+            Assert.That(mockHandler.Requests.Count(r => r.RequestUri!.PathAndQuery.Contains("/complete")), Is.EqualTo(0));
+            Assert.That(mockHandler.Requests.Count(r => r.RequestUri!.PathAndQuery.Contains("/initiate")), Is.EqualTo(1), "no session restart");
+        }
+
+        /// <summary>
+        /// 507 (quota) + 410 (session expiry) racing at concurrency 4: quota wins -- the existing
+        /// 410 session-restart recursion must NEVER fire once a quota failure is present. A
+        /// rendezvous proves BOTH chunks were genuinely dispatched before either resolves.
+        /// Deterministic (no [Retry]): see the rationale on
+        /// <see cref="ParallelChunk_AuthAndQuotaRace_AuthWins"/> -- directive A's fix means neither
+        /// dispatched chunk can be torn down by the other's group-cancel before classifying.
+        /// </summary>
+        [Test]
+        [Category("ParallelChunk")]
+        public async Task ParallelChunk_QuotaAndSessionExpiryRace_QuotaWinsNoSessionRestart()
+        {
+            long fileSize = 20L * 1024 * 1024; // 4 chunks
+            var filePath = CreateTempFile(fileSize);
+            var job = TestDataFactory.CreateChunkedUploadJob(localPath: filePath, fileSize: fileSize);
+            job.SessionRestartCount = 0;
+            sut.ChunkConcurrencyOverride = 4;
+
+            var rendezvous = new Rendezvous(2);
+            mockHandler.UseIndexedRouting = true;
+            mockHandler.EnqueueInitiate("sess-quota-410", totalChunks: 4);
+            mockHandler.EnqueueChunkCustom(0, async _ =>
+            {
+                await rendezvous.ArriveAndWaitAsync();
+                return new HttpResponseMessage(HttpStatusCode.InsufficientStorage)
+                {
+                    Content = new StringContent("{}", Encoding.UTF8, "application/json")
+                };
+            });
+            mockHandler.EnqueueChunkCustom(1, async _ =>
+            {
+                await rendezvous.ArriveAndWaitAsync();
+                return new HttpResponseMessage(HttpStatusCode.Gone)
+                {
+                    Content = new StringContent("{\"error\":{\"code\":\"upload.expired\"}}")
+                };
+            });
+            mockHandler.EnqueueChunkOk(2, delayMs: 300);
+            mockHandler.EnqueueChunkOk(3, delayMs: 300);
+            // No second initiate enqueued: a session restart would fail the test by starving the
+            // mock handler's queue (it would return a 500 "No more queued responses").
+
+            var result = await sut.UploadFileAsync(job, null, CancellationToken.None);
+
+            Assert.That(result.Success, Is.False);
+            Assert.That(result.FailureKind, Is.EqualTo(FailureKind.PermanentQuota), "quota must win over a concurrent 410 session expiry");
+            Assert.That(result.StatusCode, Is.EqualTo(507));
+            Assert.That(job.SessionRestartCount, Is.EqualTo(0), "quota must NEVER trigger the 410 session-restart recursion");
+            Assert.That(mockHandler.Requests.Count(r => r.RequestUri!.PathAndQuery.Contains("/chunks/0")), Is.EqualTo(1));
+            Assert.That(mockHandler.Requests.Count(r => r.RequestUri!.PathAndQuery.Contains("/chunks/1")), Is.EqualTo(1));
+            Assert.That(mockHandler.Requests.Count(r => r.RequestUri!.PathAndQuery.Contains("/initiate")), Is.EqualTo(1));
+        }
+
+        /// <summary>
+        /// 507 (quota) + a chunk transport fault (exhausted retries -> Transient) racing at
+        /// concurrency 4: quota still wins over the generic transient/fatal result. The transport
+        /// chunk needs 3 real attempts (2 retry delays) to exhaust, which is inherently slower
+        /// than quota's single immediate response, so quota reliably lands and cancels first;
+        /// unlike the two tests above this does not depend on the loser also landing to be
+        /// meaningful -- quota winning is asserted regardless of how far the transport chunk got.
+        /// Deterministic (no [Retry]): directive A's fix removes the underlying HttpClient/
+        /// cancellation race described on <see cref="ParallelChunk_AuthAndQuotaRace_AuthWins"/>.
+        /// </summary>
+        [Test]
+        [Category("ParallelChunk")]
+        public async Task ParallelChunk_QuotaAndTransportErrorRace_QuotaWins()
+        {
+            long fileSize = 20L * 1024 * 1024; // 4 chunks
+            var filePath = CreateTempFile(fileSize);
+            var job = TestDataFactory.CreateChunkedUploadJob(localPath: filePath, fileSize: fileSize);
+            sut.ChunkConcurrencyOverride = 4;
+            sut.ChunkRetryDelayOverride = TimeSpan.FromMilliseconds(25); // keep quota reliably faster
+
+            mockHandler.UseIndexedRouting = true;
+            mockHandler.EnqueueInitiate("sess-quota-transport", totalChunks: 4);
+            EnqueueChunkStatus(mockHandler, 0, HttpStatusCode.InsufficientStorage, delayMs: 0);
+            // Chunk 1 transport-faults on every one of its MaxChunkRetries (3) attempts.
+            for (int attempt = 0; attempt < 3; attempt++)
+            {
+                mockHandler.EnqueueChunkCustom(1, _ => Task.FromException<HttpResponseMessage>(new HttpRequestException("connection reset")));
+            }
+            mockHandler.EnqueueChunkOk(2, delayMs: 300);
+            mockHandler.EnqueueChunkOk(3, delayMs: 300);
+
+            var result = await sut.UploadFileAsync(job, null, CancellationToken.None);
+
+            Assert.That(result.Success, Is.False);
+            Assert.That(result.FailureKind, Is.EqualTo(FailureKind.PermanentQuota), "quota must win over a concurrent transient transport-error chunk");
+            Assert.That(result.StatusCode, Is.EqualTo(507));
         }
 
         /// <summary>

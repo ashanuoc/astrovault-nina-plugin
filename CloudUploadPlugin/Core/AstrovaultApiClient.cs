@@ -59,6 +59,13 @@ namespace Astrovault.Core
         // D-10: raised from 2 to 10 so multi-night outages don't exhaust the session-restart budget.
         private const int MaxSessionRestarts = 10;
 
+        // Retry-after-complete addendum: backend-confirmed §4 envelope code for a 409 on the
+        // COMPLETE route meaning "this upload session already finished successfully" -- our own
+        // retry of `complete` raced a still-in-flight original attempt that has since landed. Route
+        // -specific and CompleteUploadAsync-only; every other route's 409 stays classified Transient
+        // by FailureClassifier's default, unchanged.
+        private const string CompleteAlreadyCompleteErrorCode = "upload.already_complete";
+
         // REL-08: refresh pooled connections so overnight sessions don't reuse stale DNS / dead sockets.
         private static readonly TimeSpan PooledConnectionLifetime = TimeSpan.FromMinutes(5);
         private static readonly TimeSpan PooledConnectionIdleTimeout = TimeSpan.FromMinutes(2);
@@ -74,6 +81,11 @@ namespace Astrovault.Core
         // outer timeout.
         private static readonly TimeSpan DefaultPerAttemptChunkTimeout = TimeSpan.FromSeconds(90);
 
+        // Storage-quota plan §4 Step 6: short per-call timeout for GetQuotaAsync -- the usage line is a
+        // nice-to-have display refresh, not part of the upload path, so it must never hang anywhere
+        // near the 10-minute upload-client timeout.
+        private static readonly TimeSpan DefaultQuotaFetchTimeout = TimeSpan.FromSeconds(15);
+
         public string BaseUrl { get; }
 
         // --- Test seams (InternalsVisibleTo CloudUploadPlugin.Tests) -----------------
@@ -81,6 +93,10 @@ namespace Astrovault.Core
         // inter-attempt retry delay so they run fast. Production uses the defaults.
         internal TimeSpan PerAttemptChunkTimeout { get; set; } = DefaultPerAttemptChunkTimeout;
         internal TimeSpan ChunkRetryDelayOverride { get; set; } = TimeSpan.FromMilliseconds(ChunkRetryDelayMs);
+
+        // Storage-quota plan §4 Step 6 test seam: lets the timeout test shrink the bound instead of
+        // waiting out a real 15s. Production uses the default.
+        internal TimeSpan QuotaFetchTimeout { get; set; } = DefaultQuotaFetchTimeout;
 
         // PERF-03 test seam: lets parallel-chunk tests (which use a handler ctor without the
         // production getter-delegate) drive the effective concurrency. When non-null it takes
@@ -279,6 +295,7 @@ namespace Astrovault.Core
 
                 using var request = new HttpRequestMessage(HttpMethod.Get, $"{ApiPrefix}/auth/validate");
                 request.Headers.Add("X-API-Key", apiKey);
+                request.Headers.Add(PluginVersionHeader.HeaderName, PluginVersionHeader.Value);
 
                 // IN-04: bound the connection test with a short timeout (mirrors AuthManager.ValidateApiKeyAsync)
                 // so a dead endpoint cannot hang for the full 10-minute upload-client timeout.
@@ -302,6 +319,77 @@ namespace Astrovault.Core
         {
             [JsonProperty("valid")]
             public bool Valid { get; set; }
+        }
+
+        /// <summary>
+        /// Storage-quota plan §4 Step 6: <c>GET v1/storage/nina/quota</c>. Never throws -- every failure
+        /// mode (no key, HTTPS gate, 404 on an older server, any other non-2xx, malformed body, timeout,
+        /// network fault) returns null so the caller can hide the usage line silently. A 404 is logged
+        /// at Debug only (not a real error -- an older server predating this endpoint); every other
+        /// failure is logged at Warning, matching the rest of this client's non-spammy conventions.
+        /// </summary>
+        public async Task<QuotaUsage> GetQuotaAsync(CancellationToken cancellationToken)
+        {
+            try
+            {
+                var apiKey = authManager.GetApiKey();
+                if (string.IsNullOrEmpty(apiKey))
+                {
+                    return null;
+                }
+
+                // WR-02 / P19-01: same send-boundary HTTPS gate as every other route that attaches the
+                // X-API-Key header.
+                if (!Astrovault.AstrovaultPlugin.IsSecureEndpoint(httpClient.BaseAddress?.ToString()))
+                {
+                    Logger.Warning("[ApiClient] Refusing quota fetch: HTTPS required outside localhost");
+                    return null;
+                }
+
+                using var request = new HttpRequestMessage(HttpMethod.Get, $"{ApiPrefix}/quota");
+                request.Headers.Add("X-API-Key", apiKey);
+                request.Headers.Add(PluginVersionHeader.HeaderName, PluginVersionHeader.Value);
+
+                using var attemptCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                attemptCts.CancelAfter(QuotaFetchTimeout);
+
+                using var response = await httpClient.SendAsync(request, attemptCts.Token).ConfigureAwait(false);
+
+                if (response.StatusCode == HttpStatusCode.NotFound)
+                {
+                    // Older server, predates this endpoint -- NOT an error. No toast, no warning log.
+                    Logger.Debug("[ApiClient] Quota endpoint returned 404 (older server) -- hiding usage line");
+                    return null;
+                }
+
+                var body = await response.Content.ReadAsStringAsync(CancellationToken.None).ConfigureAwait(false);
+
+                if (!response.IsSuccessStatusCode)
+                {
+                    Logger.Warning($"[ApiClient] Quota fetch failed: HTTP {(int)response.StatusCode}");
+                    return null;
+                }
+
+                return QuotaUsageParser.TryParse(body);
+            }
+            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+            {
+                // The per-call QuotaFetchTimeout fired, not the caller's own token -- a slow/dead
+                // endpoint, not an error worth surfacing to the user for a nice-to-have display line.
+                Logger.Warning("[ApiClient] Quota fetch timed out");
+                return null;
+            }
+            catch (OperationCanceledException)
+            {
+                // Caller's own token was cancelled (e.g. plugin teardown mid-fetch) -- not a fetch
+                // failure to log as a warning.
+                return null;
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"[ApiClient] Quota fetch failed: {ex.Message}");
+                return null;
+            }
         }
 
         /// <summary>
@@ -355,8 +443,20 @@ namespace Astrovault.Core
                     return await UploadChunkedAsync(job, apiKey, progress, cancellationToken).ConfigureAwait(false);
                 }
             }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                // Storage-quota plan directive D (cancellation honesty): the CALLER's own token was
+                // cancelled (shutdown/user cancel) -- a real cancellation, not a transient failure.
+                // Rethrow so UploadManager's existing clean-cancel catch handles it (no breaker feed,
+                // no retry increment, no state change) instead of fabricating a normal failed
+                // UploadResult that gets fed back through the retry/breaker machinery.
+                throw;
+            }
             catch (OperationCanceledException)
             {
+                // The caller's own token is still live -- this is an internal bound (e.g. the
+                // HttpClient's own request timeout) firing, not a real cancel. Stays transient so it
+                // retries normally.
                 return UploadResult.Fail("Upload cancelled");
             }
             catch (FileNotFoundException)
@@ -413,6 +513,7 @@ namespace Astrovault.Core
 
             using var request = new HttpRequestMessage(HttpMethod.Post, $"{ApiPrefix}/images/upload");
             request.Headers.Add("X-API-Key", apiKey);
+            request.Headers.Add(PluginVersionHeader.HeaderName, PluginVersionHeader.Value);
             request.Content = content;
 
             Logger.Info($"[ApiClient] Single upload: {fileName} ({fileSize} bytes)");
@@ -423,10 +524,15 @@ namespace Astrovault.Core
             if (!response.IsSuccessStatusCode)
             {
                 Logger.Warning($"[ApiClient] Upload failed: {response.StatusCode}");
+                var statusCode = (int)response.StatusCode;
+                var failureKind = FailureClassifier.Classify(statusCode);
+                var quotaInfo = failureKind == FailureKind.PermanentQuota
+                    ? QuotaInfoParser.TryParse(responseBody)
+                    : null;
                 // SC6: build the error from the NUMERIC status only. Server-controllable ReasonPhrase
                 // must not flow into persisted/user-facing error text (the ToActionableError mapper keys
                 // off the number, not the phrase).
-                return UploadResult.Fail($"HTTP {(int)response.StatusCode}", (int)response.StatusCode);
+                return UploadResult.Fail($"HTTP {statusCode}", statusCode, failureKind, quotaInfo);
             }
 
             var result = JsonConvert.DeserializeObject<UploadApiResponse>(responseBody);
@@ -482,9 +588,16 @@ namespace Astrovault.Core
                     return await UploadChunkedAsync(job, apiKey, progress, cancellationToken).ConfigureAwait(false);
                 }
 
-                var resume = await GetResumeStatusAsync(job.UploadSessionId, job.TotalChunks, apiKey, cancellationToken).ConfigureAwait(false);
+                var resumeOutcome = await GetResumeStatusAsync(job.UploadSessionId, job.TotalChunks, apiKey, cancellationToken).ConfigureAwait(false);
 
-                if (resume == null)
+                if (resumeOutcome.FailureResult != null)
+                {
+                    // G9/G4 fix: a classified non-2xx (401/403/507/...) on the resume-status route is
+                    // surfaced directly -- it must NEVER be mistaken for "session expired, restart".
+                    return resumeOutcome.FailureResult;
+                }
+
+                if (resumeOutcome.SessionExpired)
                 {
                     // Session expired or not found -- try to restart
                     if (job.SessionRestartCount >= MaxSessionRestarts)
@@ -502,6 +615,8 @@ namespace Astrovault.Core
                 }
                 else
                 {
+                    var resume = resumeOutcome.Status;
+
                     // D-11: reconcile local ChunksSent with the server's AUTHORITATIVE received set,
                     // then re-send exactly the missing chunks (client-side read; no wire change).
                     SetChunksSent(job, resume.Received);
@@ -533,12 +648,15 @@ namespace Astrovault.Core
                     job.FileSize = currentLength;
                 }
 
-                var initResult = await InitiateUploadAsync(job, apiKey, cancellationToken).ConfigureAwait(false);
-                if (initResult == null)
+                var initOutcome = await InitiateUploadAsync(job, apiKey, cancellationToken).ConfigureAwait(false);
+                if (initOutcome.Response == null)
                 {
-                    return UploadResult.Fail("Failed to initiate chunked upload");
+                    // G4 drop-point fix: preserve the classified failure (status/FailureKind/QuotaInfo)
+                    // instead of discarding it into a generic message.
+                    return initOutcome.FailureResult ?? UploadResult.Fail("Failed to initiate chunked upload");
                 }
 
+                var initResult = initOutcome.Response;
                 job.UploadSessionId = initResult.UploadId;
                 job.TotalChunks = initResult.TotalChunks;
                 ResetChunksSent(job);
@@ -605,10 +723,17 @@ namespace Astrovault.Core
             using var groupCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             using var concurrencyGate = new SemaphoreSlim(maxConcurrency, maxConcurrency);
 
-            // Shared outcome flags (set under groupResultLock).
+            // Shared outcome flags (set under groupResultLock). Storage-quota plan §4 Step 1: the
+            // group must preserve the CHILD's typed result under a TOTAL precedence order --
+            // PermanentAuth > PermanentQuota > 410-session-expiry > everything else -- instead of
+            // reconstructing a generic message (G4). Auth/quota get their own dedicated slots so
+            // they can NEVER be shadowed by (or fall into) the 410 session-restart recursion below,
+            // even if a sibling also raced a 410 before honoring cancellation.
             var groupResultLock = new object();
-            bool sessionExpired = false;   // a chunk returned 410 Gone
-            UploadResult fatalResult = null; // a chunk failed non-transiently (not 410)
+            UploadResult authResult = null;    // a chunk returned 401/403 (PermanentAuth)
+            UploadResult quotaResult = null;   // a chunk returned 507 (PermanentQuota)
+            bool sessionExpired = false;       // a chunk returned 410 Gone
+            UploadResult otherResult = null;   // a chunk failed transiently, or PermanentSkipFile (400/413)
 
             // In-flight observability (PERF-03 sequential-equivalence assertion).
             int inFlight = 0;
@@ -638,7 +763,27 @@ namespace Astrovault.Core
                     var chunkHash = ComputeChunkHash(chunkBytes);
 
                     var chunkResult = await UploadChunkWithRetryAsync(
-                        job.UploadSessionId, chunkIndex, chunkBytes, chunkHash, apiKey, groupCts.Token).ConfigureAwait(false);
+                        job.UploadSessionId, chunkIndex, chunkBytes, chunkHash, apiKey, groupCts.Token, cancellationToken).ConfigureAwait(false);
+
+                    // Total precedence (storage-quota plan §4 Step 1): PermanentAuth > PermanentQuota >
+                    // 410-session-expiry > everything else. Auth/quota chunk failures cancel the shared
+                    // token and drain siblings exactly like the pre-existing 410/fatal paths, but land in
+                    // their OWN slot so they can never be shadowed by (or trigger) the 410 session-restart
+                    // recursion below -- a revoked key or full quota must never be reported as a session
+                    // expiry, no matter how the siblings race.
+                    if (chunkResult.FailureKind == FailureKind.PermanentAuth)
+                    {
+                        lock (groupResultLock) { authResult ??= chunkResult; }
+                        groupCts.Cancel();
+                        return;
+                    }
+
+                    if (chunkResult.FailureKind == FailureKind.PermanentQuota)
+                    {
+                        lock (groupResultLock) { quotaResult ??= chunkResult; }
+                        groupCts.Cancel();
+                        return;
+                    }
 
                     if (chunkResult.StatusCode == 410)
                     {
@@ -650,9 +795,12 @@ namespace Astrovault.Core
 
                     if (!chunkResult.Success)
                     {
+                        // Preserve the child's OWN typed result (transient, or PermanentSkipFile for a
+                        // 400/413 chunk) instead of reconstructing a generic Fail(...) that drops
+                        // StatusCode/FailureKind -- the G4 fix for this drop point.
                         lock (groupResultLock)
                         {
-                            fatalResult ??= UploadResult.Fail($"Chunk {chunkIndex} upload failed: {chunkResult.ErrorMessage}");
+                            otherResult ??= chunkResult;
                         }
                         groupCts.Cancel();
                         return;
@@ -712,8 +860,20 @@ namespace Astrovault.Core
             }
 
             // (3) No outer cancel: every sibling is drained, so act on the group outcome
-            // deterministically -- a 410 session-expiry restart takes precedence over a fatal result
-            // (a 410 is recoverable; we only surface the fatal if the group did not also expire).
+            // deterministically, per the TOTAL precedence order (storage-quota plan §4 Step 1):
+            // PermanentAuth > PermanentQuota > 410-session-expiry > everything else. Auth/quota are
+            // evaluated BEFORE sessionExpired so they can NEVER trigger the 410 session-restart
+            // recursion below, even if a sibling also raced a 410 before honoring cancellation.
+            if (authResult != null)
+            {
+                return authResult;
+            }
+
+            if (quotaResult != null)
+            {
+                return quotaResult;
+            }
+
             if (sessionExpired)
             {
                 if (job.SessionRestartCount >= MaxSessionRestarts)
@@ -731,9 +891,9 @@ namespace Astrovault.Core
                 return await UploadChunkedAsync(job, apiKey, progress, cancellationToken).ConfigureAwait(false);
             }
 
-            if (fatalResult != null)
+            if (otherResult != null)
             {
-                return fatalResult;
+                return otherResult;
             }
 
             // All chunks uploaded. Emit a final authoritative 100% AFTER every sibling has drained,
@@ -844,9 +1004,20 @@ namespace Astrovault.Core
         // ====================================================================
 
         /// <summary>
+        /// G4 drop-point fix: carries either the successful <see cref="InitiateResponse"/> or the
+        /// classified typed failure (status/FailureKind/QuotaInfo) instead of collapsing every
+        /// failure into a bare null.
+        /// </summary>
+        private sealed class InitiateOutcome
+        {
+            public InitiateResponse Response { get; init; }
+            public UploadResult FailureResult { get; init; }
+        }
+
+        /// <summary>
         /// Initiates a chunked upload session via POST v1/storage/nina/uploads/initiate.
         /// </summary>
-        private async Task<InitiateResponse> InitiateUploadAsync(
+        private async Task<InitiateOutcome> InitiateUploadAsync(
             UploadJob job, string apiKey, CancellationToken cancellationToken)
         {
             using var content = new MultipartFormDataContent();
@@ -857,6 +1028,7 @@ namespace Astrovault.Core
 
             using var request = new HttpRequestMessage(HttpMethod.Post, $"{ApiPrefix}/uploads/initiate");
             request.Headers.Add("X-API-Key", apiKey);
+            request.Headers.Add(PluginVersionHeader.HeaderName, PluginVersionHeader.Value);
             request.Content = content;
 
             using var response = await httpClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
@@ -865,13 +1037,21 @@ namespace Astrovault.Core
             if (!response.IsSuccessStatusCode)
             {
                 // SC3/P19-03: status only — never log the raw server response body.
-                Logger.Warning($"[ApiClient] Initiate failed: HTTP {(int)response.StatusCode}");
-                return null;
+                var statusCode = (int)response.StatusCode;
+                Logger.Warning($"[ApiClient] Initiate failed: HTTP {statusCode}");
+                var failureKind = FailureClassifier.Classify(statusCode);
+                var quotaInfo = failureKind == FailureKind.PermanentQuota
+                    ? QuotaInfoParser.TryParse(body)
+                    : null;
+                return new InitiateOutcome
+                {
+                    FailureResult = UploadResult.Fail($"Failed to initiate chunked upload: HTTP {statusCode}", statusCode, failureKind, quotaInfo)
+                };
             }
 
             var result = JsonConvert.DeserializeObject<InitiateResponse>(body);
             Logger.Info($"[ApiClient] Chunked upload initiated: {result?.UploadId}, {result?.TotalChunks} chunks");
-            return result;
+            return new InitiateOutcome { Response = result };
         }
 
         /// <summary>
@@ -942,10 +1122,18 @@ namespace Astrovault.Core
         /// </summary>
         private async Task<UploadResult> UploadChunkWithRetryAsync(
             string uploadId, int chunkIndex, byte[] chunkBytes, string chunkHash,
-            string apiKey, CancellationToken cancellationToken)
+            string apiKey, CancellationToken groupToken, CancellationToken outerToken)
         {
             for (int attempt = 0; attempt < MaxChunkRetries; attempt++)
             {
+                // Storage-quota plan directive A (chunk-group precedence race, the P0): the group-stop
+                // token gates DISPATCH ONLY. A sibling that has already classified a higher-precedence
+                // failure (auth/quota/410/fatal) and cancelled the group must stop THIS chunk from
+                // starting a NEW attempt -- but once an attempt is actually dispatched below, it must
+                // run to completion (or the real outer/per-attempt bound) undisturbed, so its response
+                // is always drained and classified before precedence is applied.
+                groupToken.ThrowIfCancellationRequested();
+
                 // REL-05: an HttpRequestMessage (and its content) cannot be re-sent, so the
                 // request + content MUST be re-created on every attempt — otherwise a retry
                 // after a transport fault would throw InvalidOperationException.
@@ -956,12 +1144,17 @@ namespace Astrovault.Core
                     $"{ApiPrefix}/uploads/{uploadId}/chunks/{chunkIndex}");
                 request.Headers.Add("X-API-Key", apiKey);
                 request.Headers.Add("X-Chunk-Hash", chunkHash);
+                request.Headers.Add(PluginVersionHeader.HeaderName, PluginVersionHeader.Value);
                 request.Content = content;
 
-                // REL-09: keep the generous outer timeout but bound THIS attempt with a per-attempt
-                // linked CTS so a stalled chunk (hung socket) is detected early and retried instead
-                // of waiting out the whole upload's outer timeout.
-                using var attemptCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                // REL-09 + chunk-race fix: bound THIS dispatched attempt with the REAL outer lifecycle
+                // token + the per-attempt timeout ONLY -- never the group-stop token. Once SendAsync is
+                // called, a sibling's later group-cancel can no longer abort this in-flight request
+                // before its response is read and classified (the actual P0 race: two chunks both
+                // reach the server, one classifies first and cancels the group, and the OTHER's
+                // already-dispatched SendAsync used to be torn down mid-flight by that same token,
+                // losing its classification entirely).
+                using var attemptCts = CancellationTokenSource.CreateLinkedTokenSource(outerToken);
                 attemptCts.CancelAfter(PerAttemptChunkTimeout);
 
                 TimeSpan? retryAfterDelay = null;
@@ -980,19 +1173,40 @@ namespace Astrovault.Core
                         return UploadResult.Ok(null);
                     }
 
+                    var statusCode = (int)response.StatusCode;
+                    var failureKind = FailureClassifier.Classify(statusCode);
+                    if (failureKind != FailureKind.Transient)
+                    {
+                        // 401/403/507/400/413 -- permanent per the classifier; do NOT retry this chunk.
+                        // Only read the body when it is actually needed (507 -- QuotaInfo); avoids an
+                        // unnecessary await on the auth/skip-file paths. CancellationToken.None here is
+                        // deliberate: the response has ALREADY been received and this chunk is already
+                        // committed to a terminal result -- a SIBLING chunk's group-cancel (e.g. a 410
+                        // that resolves with no further awaits) must not race this already-decided
+                        // chunk's own body read and silently drop its QuotaInfo/result.
+                        QuotaInfo quotaInfo = null;
+                        if (failureKind == FailureKind.PermanentQuota)
+                        {
+                            var errorBody = await response.Content.ReadAsStringAsync(CancellationToken.None).ConfigureAwait(false);
+                            quotaInfo = QuotaInfoParser.TryParse(errorBody);
+                        }
+                        Logger.Warning($"[ApiClient] Chunk {chunkIndex} permanent failure: HTTP {statusCode}");
+                        return UploadResult.Fail($"Chunk {chunkIndex} failed: HTTP {statusCode}", statusCode, failureKind, quotaInfo);
+                    }
+
                     // PERF-04: honor Retry-After on 429/503 (header read only — NOT a wire change).
                     // Supports BOTH forms: Delta (seconds) and an absolute HTTP-date.
-                    if ((int)response.StatusCode == 429 || response.StatusCode == HttpStatusCode.ServiceUnavailable)
+                    if (statusCode == 429 || response.StatusCode == HttpStatusCode.ServiceUnavailable)
                     {
                         retryAfterDelay = GetRetryAfterDelay(response);
                     }
 
-                    Logger.Warning($"[ApiClient] Chunk {chunkIndex} attempt {attempt + 1} failed: HTTP {(int)response.StatusCode}");
+                    Logger.Warning($"[ApiClient] Chunk {chunkIndex} attempt {attempt + 1} failed: HTTP {statusCode}");
                 }
-                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                catch (OperationCanceledException) when (outerToken.IsCancellationRequested)
                 {
-                    // REL-04 semantics: the OUTER token was cancelled (user cancel) — this is a
-                    // clean cancel, NOT a transient transport fault. Propagate.
+                    // REL-04 semantics: the REAL outer token was cancelled (user cancel/shutdown) —
+                    // this is a clean cancel, NOT a transient transport fault. Propagate.
                     throw;
                 }
                 catch (Exception ex) when (
@@ -1007,16 +1221,20 @@ namespace Astrovault.Core
                     {
                         return UploadResult.Fail($"Chunk {chunkIndex} transport error after {MaxChunkRetries} attempts: {ex.Message}");
                     }
-                    await Task.Delay(ChunkRetryDelayOverride, cancellationToken).ConfigureAwait(false);
+                    // Inter-retry wait: gated on the GROUP-stop token (directive A) -- an already-decided
+                    // sibling must be able to cut short a chunk that is merely sleeping between attempts
+                    // (nothing dispatched, nothing to lose by stopping here).
+                    await Task.Delay(ChunkRetryDelayOverride, groupToken).ConfigureAwait(false);
                     continue;
                 }
 
-                // Transient HTTP-status failure -- retry after the (possibly Retry-After) delay
+                // Transient HTTP-status failure -- retry after the (possibly Retry-After) delay, gated
+                // on the group-stop token (an inter-retry wait, never an in-flight request).
                 if (attempt < MaxChunkRetries - 1)
                 {
                     var delay = retryAfterDelay ?? ChunkRetryDelayOverride;
                     Logger.Warning($"[ApiClient] Chunk {chunkIndex} retrying in {delay.TotalMilliseconds:F0}ms...");
-                    await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+                    await Task.Delay(delay, groupToken).ConfigureAwait(false);
                 }
             }
 
@@ -1064,6 +1282,7 @@ namespace Astrovault.Core
             using var request = new HttpRequestMessage(HttpMethod.Post,
                 $"{ApiPrefix}/uploads/{uploadId}/complete");
             request.Headers.Add("X-API-Key", apiKey);
+            request.Headers.Add(PluginVersionHeader.HeaderName, PluginVersionHeader.Value);
             request.Content = content;
 
             using var response = await httpClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
@@ -1075,7 +1294,46 @@ namespace Astrovault.Core
                 {
                     return UploadResult.Fail("Session expired during complete", 410);
                 }
-                return UploadResult.Fail($"Complete failed: HTTP {(int)response.StatusCode}");
+
+                // Retry-after-complete addendum: the BFF's 300s downstream timeout means OUR OWN
+                // retry of `complete` can arrive after the original attempt already finished
+                // server-side. A 409 here is the backend's two-outcome answer to that race:
+                //   - winner still working  -> 503 upload.completion_in_progress (falls through
+                //     below; already classified Transient by FailureClassifier's default -- no
+                //     special-casing needed, just a regression pin in the test suite).
+                //   - winner finished        -> 409 upload.already_complete -- the file LANDED. This
+                //     is the ONLY 409 shape ever treated as success; every other 409 (a different
+                //     code, an unparseable/missing body, or a flat non-envelope body) keeps today's
+                //     Transient behavior below. Wrong-success would silently drop a frame (forbidden
+                //     direction); wrong-retry only costs one extra request -- the asymmetry is
+                //     deliberate. Route-specific: this exact-match check exists ONLY here, never on
+                //     initiate/chunk/resume-status, whose 409s remain unconditionally Transient.
+                if (response.StatusCode == HttpStatusCode.Conflict)
+                {
+                    var errorCode = ErrorEnvelopeParser.TryParseErrorCode(body);
+                    if (string.Equals(errorCode, CompleteAlreadyCompleteErrorCode, StringComparison.Ordinal))
+                    {
+                        // The 409 body does not carry the normal completion payload (no
+                        // remoteUrl/remotePath) -- mirror the parallel-chunk success path's own
+                        // UploadResult.Ok(null) (this same file, chunk PUT success branch): nothing
+                        // downstream dereferences RemoteUrl unconditionally (UploadManager.
+                        // HandleUploadSuccess takes only the job, never the result).
+                        Logger.Info($"[ApiClient] Complete 409 {CompleteAlreadyCompleteErrorCode} -- upload already finished server-side, treating as success");
+                        return UploadResult.Ok(null);
+                    }
+                    // Any other code / unparseable / flat body -- fall through to the standard
+                    // classify-and-fail path below (Transient, same as today).
+                }
+
+                // G4 drop-point fix: classify instead of collapsing every non-410 status into a
+                // generic, un-typed failure.
+                var statusCode = (int)response.StatusCode;
+                var failureKind = FailureClassifier.Classify(statusCode);
+                var quotaInfo = failureKind == FailureKind.PermanentQuota
+                    ? QuotaInfoParser.TryParse(body)
+                    : null;
+                Logger.Warning($"[ApiClient] Complete failed: HTTP {statusCode}");
+                return UploadResult.Fail($"Complete failed: HTTP {statusCode}", statusCode, failureKind, quotaInfo);
             }
 
             var result = JsonConvert.DeserializeObject<CompleteResponse>(body);
@@ -1108,25 +1366,59 @@ namespace Astrovault.Core
         }
 
         /// <summary>
-        /// Queries the server for the status of an existing upload session.
-        /// Returns the authoritative received + missing chunk sets, or null if the session is
-        /// expired/not found (caller restarts).
+        /// G9/G4 fix: carries one of three outcomes from a resume-status check instead of the old
+        /// "null means restart" contract, which conflated 404/410 session-expiry with an
+        /// unclassified non-2xx (e.g. 401/403/507 would have been deserialized as if it were a
+        /// status body -- G9). <see cref="SessionExpired"/> is true only for the route-specific
+        /// 404/410 case; every other non-2xx failure classifies into <see cref="FailureResult"/>.
         /// </summary>
-        private async Task<ResumeStatus> GetResumeStatusAsync(
+        private sealed class ResumeOutcome
+        {
+            public ResumeStatus Status { get; init; }
+            public bool SessionExpired { get; init; }
+            public UploadResult FailureResult { get; init; }
+        }
+
+        /// <summary>
+        /// Queries the server for the status of an existing upload session.
+        /// Returns the authoritative received + missing chunk sets, a session-expired signal
+        /// (404/410 -- caller restarts), or a classified failure for every other non-2xx status.
+        /// </summary>
+        private async Task<ResumeOutcome> GetResumeStatusAsync(
             string uploadId, int totalChunks, string apiKey, CancellationToken cancellationToken)
         {
             using var request = new HttpRequestMessage(HttpMethod.Get, $"{ApiPrefix}/uploads/{uploadId}/status");
             request.Headers.Add("X-API-Key", apiKey);
+            request.Headers.Add(PluginVersionHeader.HeaderName, PluginVersionHeader.Value);
 
             using var response = await httpClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
 
             if (response.StatusCode == HttpStatusCode.Gone ||
                 response.StatusCode == HttpStatusCode.NotFound)
             {
-                return null; // Signal: need fresh session
+                // Route-specific session-expiry semantics -- NOT globalized through the classifier.
+                return new ResumeOutcome { SessionExpired = true };
             }
 
             var body = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
+
+            if (!response.IsSuccessStatusCode)
+            {
+                // G9 fix: this branch used to fall through and deserialize the body as if it were a
+                // success-shaped UploadStatusResponse, regardless of status. Every non-404/410
+                // failure (401/403/507/5xx/...) is now classified instead.
+                var statusCode = (int)response.StatusCode;
+                var failureKind = FailureClassifier.Classify(statusCode);
+                var quotaInfo = failureKind == FailureKind.PermanentQuota
+                    ? QuotaInfoParser.TryParse(body)
+                    : null;
+                Logger.Warning($"[ApiClient] Resume status check failed: HTTP {statusCode}");
+                return new ResumeOutcome
+                {
+                    FailureResult = UploadResult.Fail($"Resume status check failed: HTTP {statusCode}", statusCode, failureKind, quotaInfo)
+                };
+            }
+
             var status = JsonConvert.DeserializeObject<UploadStatusResponse>(body);
             var received = new HashSet<int>(status?.ReceivedChunks ?? new List<int>());
 
@@ -1137,7 +1429,7 @@ namespace Astrovault.Core
             }
 
             Logger.Info($"[ApiClient] Resume: {received.Count} of {totalChunks} chunks already uploaded (server-authoritative)");
-            return new ResumeStatus { Received = received, Missing = missing };
+            return new ResumeOutcome { Status = new ResumeStatus { Received = received, Missing = missing } };
         }
 
         public void Dispose()

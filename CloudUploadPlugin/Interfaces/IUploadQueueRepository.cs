@@ -160,5 +160,102 @@ namespace Astrovault.Interfaces
         /// The file is retained for manual recovery; it is never auto-imported.
         /// </summary>
         string CorruptQueueFileName { get; }
+
+        // ====================================================================
+        // Blocked-state machine (storage-quota plan §4 Step 2)
+        // ====================================================================
+
+        /// <summary>
+        /// The currently persisted block (Kind == <see cref="UploadBlockKind.None"/> when not
+        /// blocked). Restored from disk at construction time so a block SURVIVES a NINA restart.
+        /// Safe to read without external synchronization -- transitions always swap in a brand-new,
+        /// fully-formed instance under the repository's internal lock, so a caller never observes a
+        /// torn/partial state.
+        /// </summary>
+        UploadBlockState CurrentBlock { get; }
+
+        /// <summary>
+        /// Atomically transitions the queue into a blocked state (storage-quota plan §4 Step 2, point 2):
+        /// in ONE semaphore-held commit, the job identified by <paramref name="failedJobId"/> is returned
+        /// to <see cref="UploadStatus.Pending"/> (never <see cref="UploadStatus.Failed"/>, nothing
+        /// discarded, <see cref="UploadJob.QueuedAt"/> untouched) AND the block state (kind/snapshot/identity)
+        /// is persisted together with it. <paramref name="identity"/>'s raw API key is used only to derive
+        /// a salted fingerprint internally -- it is never itself persisted (point 4: "never a bare digest").
+        /// <paramref name="snapshot"/>'s numeric fields are copied through as given; the repository always
+        /// stamps its own commit-time UTC timestamp rather than trusting a caller-supplied clock.
+        /// </summary>
+        /// <returns>
+        /// True when the commit durably succeeded. False when the disk write failed -- the in-memory
+        /// state (job Pending, <see cref="CurrentBlock"/> reflecting the new block) is still applied
+        /// (fail-safe: the caller must treat this as "stopped, but NOT proven durable" and surface a
+        /// distinct warning -- never claim a durability that did not happen).
+        /// </returns>
+        Task<bool> SetBlockAsync(UploadBlockKind kind, Guid failedJobId, UploadBlockSnapshot snapshot, UploadBlockIdentityInput identity);
+
+        /// <summary>
+        /// Atomically clears the persisted block (<see cref="CurrentBlock"/> becomes
+        /// <see cref="UploadBlockState.None"/>) and durably pins <paramref name="resumePriorityJobId"/>
+        /// as the next job <see cref="PeekAsync"/> must return, ahead of the normal drain order.
+        /// <see cref="UploadJob.QueuedAt"/> is never mutated for the pinned job. Pass null to clear the
+        /// block without pinning any job (e.g. a foreign-identity block discarded on load).
+        /// </summary>
+        /// <returns>True when the commit durably succeeded; see <see cref="SetBlockAsync"/>'s remarks
+        /// on the fail-safe meaning of a false return.</returns>
+        Task<bool> ClearBlockAsync(Guid? resumePriorityJobId);
+
+        /// <summary>
+        /// Computes a salted HMAC-SHA256 fingerprint of <paramref name="apiKey"/> using this
+        /// repository's per-installation identity salt (stored inside the same DPAPI-encrypted
+        /// envelope as the queue itself, generated lazily on first use and persisted immediately so
+        /// later calls -- including after a restart -- derive the SAME fingerprint for the SAME key).
+        /// The salt itself is never exposed -- only the resulting fingerprint. Returns null for a
+        /// null/empty <paramref name="apiKey"/> (a "missing current identity" input).
+        /// </summary>
+        Task<string> ComputeIdentityFingerprintAsync(string apiKey);
+
+        /// <summary>
+        /// Storage-quota plan (C-P1#1 fix): durably resets a SPECIFIC job back to
+        /// <see cref="UploadStatus.Pending"/>, but ONLY if it is CURRENTLY <see cref="UploadStatus.InProgress"/>
+        /// -- a job that has already moved to some other status is left untouched. Called from
+        /// <c>UploadManager</c>'s clean-cancellation catch so a cleanly-cancelled upload (endpoint
+        /// reinit, Disconnect, shutdown) is immediately visible to <see cref="PeekAsync"/> again within
+        /// the SAME repository instance/process, without waiting for a fresh disk load
+        /// (<c>LoadQueueFromDisk</c> already resets EVERY InProgress job on a fresh load; this is the
+        /// same-process counterpart for one specific job).
+        /// </summary>
+        /// <returns>True when nothing needed resetting, or the reset persisted durably; false when the
+        /// in-memory reset happened but the commit failed to persist (the in-memory state stays
+        /// Pending regardless -- callers are not required to act on a false return, it exists so the
+        /// failure can be logged/observed honestly instead of silently discarded).</returns>
+        Task<bool> ResetJobToPendingIfInProgressAsync(Guid jobId);
+
+        /// <summary>
+        /// Storage-quota plan (C-P1#1 fix): durably resets EVERY job currently
+        /// <see cref="UploadStatus.InProgress"/> back to <see cref="UploadStatus.Pending"/>, in ONE
+        /// semaphore-held commit -- the same-process defensive counterpart to what <c>LoadQueueFromDisk</c>
+        /// already does for a fresh load. Called from <c>UploadManager.StartAsync</c> so a job left
+        /// InProgress by an abnormal termination of a PREVIOUS processing loop can never remain
+        /// permanently invisible to <see cref="PeekAsync"/> within the live repository instance.
+        /// </summary>
+        /// <returns>
+        /// The number of jobs affected IN MEMORY -- always the count of jobs flipped Pending regardless of
+        /// whether the subsequent disk persist succeeded. Unlike <see cref="ResetJobToPendingIfInProgressAsync"/>,
+        /// this method has no boolean success channel to report a failed persist through: a failed commit
+        /// still logs a warning internally (never silently), but the returned count does NOT tell the
+        /// caller whether the reset reached disk -- only how many jobs were reset in memory. Callers that
+        /// need durability confirmation must not infer it from a non-zero return.
+        /// </returns>
+        Task<int> ResetAllInProgressToPendingAsync();
+
+        /// <summary>
+        /// Storage-quota plan directive E (C-P1#4a): durably rewrites the CURRENTLY latched block's
+        /// identity to carry <paramref name="accountId"/>, in ONE semaphore-held commit -- the "upgrade"
+        /// path for a block that was entered before its account id was known (fingerprint+endpoint
+        /// scoping only). Leaves the block's Kind/Snapshot/FailedJobId and the identity's
+        /// EndpointUrl/KeyFingerprint untouched; only AccountId changes. A no-op (returns true) when
+        /// nothing is currently latched. Never claims a durability that did not happen: on a failed disk
+        /// write, the in-memory identity is rolled back to its pre-attempt value and false is returned.
+        /// </summary>
+        Task<bool> UpgradeBlockAccountIdAsync(string accountId);
     }
 }

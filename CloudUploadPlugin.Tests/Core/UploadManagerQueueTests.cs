@@ -127,6 +127,53 @@ namespace CloudUploadPlugin.Tests.Core
                 "HandleUploadSuccess should NOT call RemoveJobAsync (retain completed jobs)");
         }
 
+        // ====================================================================
+        // Retry-after-complete addendum: a 409 upload.already_complete on the chunked COMPLETE
+        // route is now classified as SUCCESS by AstrovaultApiClient.CompleteUploadAsync (see
+        // ChunkedUploadTests.CompleteUpload_409AlreadyComplete_TreatedAsSuccess for the API-client-
+        // level parsing/short-circuit). The 409 body carries no remoteUrl/remotePath, so the client
+        // builds the success result with a NULL RemoteUrl. This manager-level test proves the
+        // downstream contract: a null-RemoteUrl success result still completes the job exactly
+        // once, schedules no retry, and triggers no second upload attempt -- so the frame is never
+        // re-queued into a duplicate upload / double quota charge.
+        // ====================================================================
+
+        [Test]
+        public async Task UploadJobAsync_SuccessResultWithNullRemoteUrl_CompletesOnceNoRetryNoDuplicateAttempt()
+        {
+            mockQueueRepo.Setup(r => r.GetTotalPendingSizeAsync())
+                .ReturnsAsync(0L);
+
+            var job = TestDataFactory.CreateUploadJob();
+
+            mockApiClient
+                .Setup(a => a.UploadFileAsync(job, It.IsAny<IProgress<double>>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(UploadResult.Ok(null));
+
+            await sut.UploadJobAsync(job, CancellationToken.None);
+
+            // Job reaches Completed exactly once -- nothing downstream (HandleUploadSuccess takes
+            // only the job, never the result) dereferences the missing RemoteUrl.
+            mockQueueRepo.Verify(
+                r => r.UpdateJobStatusAsync(job.Id, UploadStatus.Completed, It.IsAny<string>()),
+                Times.Once);
+
+            // No retry/failure path was taken.
+            mockQueueRepo.Verify(
+                r => r.ScheduleRetryAsync(It.IsAny<Guid>(), It.IsAny<DateTime>(), It.IsAny<string>()),
+                Times.Never);
+            mockQueueRepo.Verify(
+                r => r.MarkFailedAsync(It.IsAny<Guid>(), It.IsAny<string>(), It.IsAny<bool>()),
+                Times.Never);
+
+            // Exactly one upload attempt -- a success result must never trigger a second (duplicate)
+            // attempt at the file/apiClient boundary.
+            mockApiClient.Verify(
+                a => a.UploadFileAsync(job, It.IsAny<IProgress<double>>(), It.IsAny<CancellationToken>()),
+                Times.Once,
+                "a result already classified as success must not be re-attempted (would duplicate the upload)");
+        }
+
         [Test]
         public async Task RetryDelegation_CallsRepository()
         {

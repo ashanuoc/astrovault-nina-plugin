@@ -318,8 +318,10 @@ namespace Astrovault.Tests.Core
             var dir = new DirectoryInfo(TestContext.CurrentContext.TestDirectory);
             while (dir != null)
             {
+                // .git is a directory in a normal clone but a file in a git worktree
                 if (File.Exists(Path.Combine(dir.FullName, "CloudUploadPlugin.sln"))
-                    || Directory.Exists(Path.Combine(dir.FullName, ".git")))
+                    || Directory.Exists(Path.Combine(dir.FullName, ".git"))
+                    || File.Exists(Path.Combine(dir.FullName, ".git")))
                 {
                     return dir.FullName;
                 }

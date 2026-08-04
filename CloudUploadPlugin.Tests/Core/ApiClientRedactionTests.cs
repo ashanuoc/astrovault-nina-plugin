@@ -144,6 +144,22 @@ namespace Astrovault.Tests.Core
                 "The send-boundary gate must return before the key request is created -- SendAsync must never run (WR-02).");
         }
 
+        // ===== Storage-quota plan §4 Step 6: GetQuotaAsync also gates the key behind the HTTPS send-boundary =====
+
+        [Test]
+        public async Task GetQuotaAsync_NonLoopbackHttpBase_RefusesWithoutInvokingHandler_ReturnsNull()
+        {
+            var handler = new ThrowingHandler();
+            var auth = AuthReturningKey();
+            using var client = new AstrovaultApiClient(auth.Object, "http://example.com/", handler);
+
+            var result = await client.GetQuotaAsync(CancellationToken.None);
+
+            Assert.That(result, Is.Null, "GetQuotaAsync must refuse a non-loopback http endpoint and return null.");
+            Assert.That(handler.SendInvoked, Is.False,
+                "The send-boundary gate must return before the quota request is created -- SendAsync must never run.");
+        }
+
         // ===== LEAK-SCAN (MED item 3): grep-driven source-scan across the four files =====
 
         [Test]
@@ -297,8 +313,10 @@ namespace Astrovault.Tests.Core
                 var dir = new DirectoryInfo(TestContext.CurrentContext.TestDirectory);
                 while (dir != null)
                 {
+                    // .git is a directory in a normal clone but a file in a git worktree
                     if (File.Exists(Path.Combine(dir.FullName, "CloudUploadPlugin.sln"))
-                        || Directory.Exists(Path.Combine(dir.FullName, ".git")))
+                        || Directory.Exists(Path.Combine(dir.FullName, ".git"))
+                        || File.Exists(Path.Combine(dir.FullName, ".git")))
                     {
                         return dir.FullName;
                     }

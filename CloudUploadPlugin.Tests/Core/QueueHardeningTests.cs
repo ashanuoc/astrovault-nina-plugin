@@ -6,6 +6,7 @@ using System.Reflection;
 using System.Threading.Tasks;
 using Astrovault.Data;
 using Astrovault.Models;
+using Newtonsoft.Json.Linq;
 
 namespace CloudUploadPlugin.Tests.Core
 {
@@ -649,8 +650,8 @@ namespace CloudUploadPlugin.Tests.Core
             Assert.That(token.Type, Is.EqualTo(Newtonsoft.Json.Linq.JTokenType.Object),
                 "Re-saved queue.dat must be a {SchemaVersion, Jobs} object, not a bare array");
             Assert.That(token["SchemaVersion"], Is.Not.Null, "Envelope must carry SchemaVersion");
-            Assert.That(token["SchemaVersion"]!.ToObject<int>(), Is.EqualTo(2),
-                "Current envelope schema is v2 (adds the persisted CompletedTotal running total)");
+            Assert.That(token["SchemaVersion"]!.ToObject<int>(), Is.EqualTo(3),
+                "Current envelope schema is v3 (adds the persisted blocked-state fields -- storage-quota plan §4 Step 2)");
             Assert.That(token["CompletedTotal"], Is.Not.Null, "v2 envelope must carry CompletedTotal");
             Assert.That(token["Jobs"], Is.Not.Null, "Envelope must carry Jobs array");
         }
@@ -834,6 +835,102 @@ namespace CloudUploadPlugin.Tests.Core
             var reloaded = (await repo2.GetJobsByStatusAsync(UploadStatus.Failed)).Single();
             Assert.That(reloaded.LastFailureReason, Is.EqualTo("permanent reason"));
             Assert.That(reloaded.IsPermanentFailure, Is.True);
+        }
+
+        // ====================================================================
+        // Storage-quota plan (C-P1#1 fix): same-process InProgress -> Pending reset primitives.
+        // ====================================================================
+
+        [Test]
+        public async Task ResetJobToPendingIfInProgressAsync_JobIsInProgress_ResetsToPending_Durably()
+        {
+            var repo = new UploadQueueRepository(tempDir);
+            var job = CreatePendingJob();
+            await repo.EnqueueAsync(job);
+            await repo.UpdateJobStatusAsync(job.Id, UploadStatus.InProgress);
+            Assert.That(await repo.GetJobCountAsync(UploadStatus.InProgress), Is.EqualTo(1), "Precondition");
+
+            var committed = await repo.ResetJobToPendingIfInProgressAsync(job.Id);
+
+            Assert.That(committed, Is.True, "The reset must report that it persisted durably");
+            Assert.That(await repo.GetJobCountAsync(UploadStatus.InProgress), Is.EqualTo(0));
+            var pending = (await repo.GetJobsByStatusAsync(UploadStatus.Pending)).ToList();
+            Assert.That(pending.Select(j => j.Id), Does.Contain(job.Id));
+
+            // D-verdict fix (item 1): decrypt the ACTUAL persisted envelope (via the existing DecryptData
+            // test seam -- see UploadQueueRepositoryBlockTests.ReadDecryptedQueue) and assert the job's
+            // status is Pending IN THE FILE. Asserting only via a fresh repository's reload (the old
+            // version of this test) is false-positive-prone: LoadQueueFromDisk itself converts a
+            // persisted InProgress status back to Pending on load, so that assertion would still pass
+            // even if SaveQueueToDiskAsync had silently never written the reset to disk at all.
+            var json = ReadDecryptedQueue();
+            var token = JObject.Parse(json);
+            var persistedJob = token["Jobs"]!.Single(j => j["Id"]!.ToObject<Guid>() == job.Id);
+            Assert.That(persistedJob["Status"]!.ToString(), Is.EqualTo("Pending"),
+                "The reset must be persisted to disk, not merely visible after a reload's own InProgress -> Pending conversion");
+        }
+
+        [Test]
+        public async Task ResetJobToPendingIfInProgressAsync_JobNotInProgress_LeavesItUntouched()
+        {
+            // A job that has already moved on (e.g. genuinely completed) must not be clobbered back to
+            // Pending by a late-arriving reset call.
+            var repo = new UploadQueueRepository(tempDir);
+            var job = CreatePendingJob();
+            await repo.EnqueueAsync(job);
+            await repo.UpdateJobStatusAsync(job.Id, UploadStatus.Completed);
+
+            await repo.ResetJobToPendingIfInProgressAsync(job.Id);
+
+            Assert.That(await repo.GetJobCountAsync(UploadStatus.Completed), Is.EqualTo(1),
+                "A non-InProgress job must be left exactly as it was");
+            Assert.That(await repo.GetJobCountAsync(UploadStatus.Pending), Is.EqualTo(0));
+        }
+
+        [Test]
+        public async Task ResetJobToPendingIfInProgressAsync_UnknownJobId_NoOp_NeverThrows()
+        {
+            var repo = new UploadQueueRepository(tempDir);
+            Assert.That(async () => await repo.ResetJobToPendingIfInProgressAsync(Guid.NewGuid()), Throws.Nothing);
+        }
+
+        [Test]
+        public async Task ResetAllInProgressToPendingAsync_ResetsEveryInProgressJob_LeavesOthersAlone()
+        {
+            var repo = new UploadQueueRepository(tempDir);
+            var inProgress1 = CreatePendingJob();
+            var inProgress2 = CreatePendingJob();
+            var stillPending = CreatePendingJob();
+            var completed = CreatePendingJob();
+            await repo.EnqueueAsync(inProgress1);
+            await repo.EnqueueAsync(inProgress2);
+            await repo.EnqueueAsync(stillPending);
+            await repo.EnqueueAsync(completed);
+            await repo.UpdateJobStatusAsync(inProgress1.Id, UploadStatus.InProgress);
+            await repo.UpdateJobStatusAsync(inProgress2.Id, UploadStatus.InProgress);
+            await repo.UpdateJobStatusAsync(completed.Id, UploadStatus.Completed);
+
+            var resetCount = await repo.ResetAllInProgressToPendingAsync();
+
+            Assert.That(resetCount, Is.EqualTo(2));
+            Assert.That(await repo.GetJobCountAsync(UploadStatus.InProgress), Is.EqualTo(0));
+            var pendingIds = (await repo.GetJobsByStatusAsync(UploadStatus.Pending)).Select(j => j.Id).ToList();
+            Assert.That(pendingIds, Does.Contain(inProgress1.Id));
+            Assert.That(pendingIds, Does.Contain(inProgress2.Id));
+            Assert.That(pendingIds, Does.Contain(stillPending.Id));
+            Assert.That(await repo.GetJobCountAsync(UploadStatus.Completed), Is.EqualTo(1),
+                "A genuinely completed job must never be reset");
+        }
+
+        [Test]
+        public async Task ResetAllInProgressToPendingAsync_NothingInProgress_ReturnsZero_NoOp()
+        {
+            var repo = new UploadQueueRepository(tempDir);
+            await repo.EnqueueAsync(CreatePendingJob());
+
+            var resetCount = await repo.ResetAllInProgressToPendingAsync();
+
+            Assert.That(resetCount, Is.EqualTo(0));
         }
 
         /// <summary>

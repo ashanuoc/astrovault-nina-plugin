@@ -125,6 +125,98 @@ namespace CloudUploadPlugin.Tests.Core
         }
 
         // ====================================================================
+        // G5 fix: FailureKind/status-keyed mapping (storage-quota plan §4 Step 1) takes
+        // precedence over the legacy substring match. The legacy 2-arg call sites above are
+        // unaffected (statusCode/failureKind default to 0/Transient, so they still fall through
+        // to the substring fallback -- proving backward compatibility).
+        // ====================================================================
+
+        [Test]
+        public void ToActionableError_PermanentAuth_ReturnsApiKeyMessage_RegardlessOfMessageText()
+        {
+            // The message text deliberately does NOT contain "401" or "Invalid API key" -- proving
+            // the mapping is keyed off FailureKind, not a substring of the message.
+            var result = AstrovaultPlugin.ToActionableError("test.fits", "some opaque server text", 401, FailureKind.PermanentAuth);
+
+            Assert.That(result, Does.StartWith("test.fits:"));
+            Assert.That(result, Does.Contain("API key rejected"));
+        }
+
+        [Test]
+        public void ToActionableError_PermanentAuth_403_ReturnsApiKeyMessage()
+        {
+            var result = AstrovaultPlugin.ToActionableError("test.fits", "opaque text", 403, FailureKind.PermanentAuth);
+
+            Assert.That(result, Does.Contain("API key rejected"));
+        }
+
+        [Test]
+        public void ToActionableError_PermanentQuota_ReturnsQuotaMessage_RegardlessOfMessageText()
+        {
+            var result = AstrovaultPlugin.ToActionableError("test.fits", "opaque server text", 507, FailureKind.PermanentQuota);
+
+            Assert.That(result, Does.StartWith("test.fits:"));
+            Assert.That(result, Does.Contain("Storage quota exceeded"));
+        }
+
+        [Test]
+        public void ToActionableError_PermanentSkipFile_400_ReturnsServerRejectedMessage()
+        {
+            var result = AstrovaultPlugin.ToActionableError("test.fits", "opaque text", 400, FailureKind.PermanentSkipFile);
+
+            Assert.That(result, Does.Contain("Server rejected this file"));
+            Assert.That(result, Does.Contain("invalid request"));
+        }
+
+        [Test]
+        public void ToActionableError_PermanentSkipFile_413_ReturnsTooLargeMessage()
+        {
+            var result = AstrovaultPlugin.ToActionableError("test.fits", "opaque text", 413, FailureKind.PermanentSkipFile);
+
+            Assert.That(result, Does.Contain("Server rejected this file"));
+            Assert.That(result, Does.Contain("too large"));
+        }
+
+        [Test]
+        public void ToActionableError_PermanentSkipFile_LocalFileError_FallsThroughToLegacyMapping()
+        {
+            // A local FailPermanent (statusCode 0) must NOT hit the "server rejected this file"
+            // branch -- it falls through to the existing substring-based file-not-found mapping.
+            var result = AstrovaultPlugin.ToActionableError("test.fits", "File not found at C:\\images\\test.fits", 0, FailureKind.PermanentSkipFile);
+
+            Assert.That(result, Does.Contain("deleted or moved"));
+            Assert.That(result, Does.Not.Contain("Server rejected"));
+        }
+
+        [Test]
+        public void ToActionableError_TypedStatus429_ReturnsRateLimitMessage()
+        {
+            var result = AstrovaultPlugin.ToActionableError("test.fits", "opaque text", 429, FailureKind.Transient);
+
+            Assert.That(result, Does.Contain("Rate limited"));
+        }
+
+        [TestCase(500)]
+        [TestCase(502)]
+        [TestCase(503)]
+        public void ToActionableError_TypedServerErrorStatus_ReturnsServerErrorMessage(int statusCode)
+        {
+            var result = AstrovaultPlugin.ToActionableError("test.fits", "opaque text", statusCode, FailureKind.Transient);
+
+            Assert.That(result, Does.Contain("Server error"));
+        }
+
+        [Test]
+        public void ToActionableError_LegacyTwoArgOverload_StillUsesSubstringFallback()
+        {
+            // Backward-compat: the pre-existing 2-arg call sites (statusCode/failureKind omitted)
+            // keep exercising the original substring-based mapping unchanged.
+            var result = AstrovaultPlugin.ToActionableError("test.fits", "Server returned 500");
+
+            Assert.That(result, Does.Contain("Server error"));
+        }
+
+        // ====================================================================
         // NotificationVerbosity: Enum Parsing & Persistence
         // ====================================================================
 

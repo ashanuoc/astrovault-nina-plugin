@@ -56,11 +56,14 @@ namespace Astrovault.Data
         private const int MaxFailedJobsRetained = 200;
 
         /// <summary>
-        /// Current on-disk queue schema version (the {SchemaVersion, Jobs, CompletedTotal} envelope).
-        /// v2 added the persisted CompletedTotal running total; v1 files (no CompletedTotal) are
-        /// migrated on load by seeding the total from the retained completed-job count.
+        /// Current on-disk queue schema version (the {SchemaVersion, Jobs, CompletedTotal, Block,
+        /// ResumePriorityJobId, IdentitySalt} envelope). v2 added the persisted CompletedTotal running
+        /// total; v1 files (no CompletedTotal) are migrated on load by seeding the total from the
+        /// retained completed-job count. v3 (storage-quota plan §4 Step 2) additively adds the
+        /// blocked-state fields -- a v2 (or v1) file loads fine, with Block defaulting to "not blocked",
+        /// no resume pin, and no identity salt (lazily generated + persisted on first use).
         /// </summary>
-        private const int CurrentSchemaVersion = 2;
+        private const int CurrentSchemaVersion = 3;
 
         /// <summary>
         /// JSON settings for queue persistence. Statuses are serialized by NAME (StringEnumConverter)
@@ -120,6 +123,37 @@ namespace Astrovault.Data
         /// Retained for manual recovery; never auto-imported.
         /// </summary>
         public string CorruptQueueFileName { get; private set; }
+
+        // ====================================================================
+        // Blocked-state machine (storage-quota plan §4 Step 2)
+        // ====================================================================
+
+        /// <summary>
+        /// Backing field for <see cref="CurrentBlock"/>. ALWAYS replaced wholesale (never mutated
+        /// in place) under <see cref="semaphore"/>, then published via <see cref="Volatile.Write"/> so a
+        /// reader without the lock (e.g. UploadManager's counter/UI reads) sees either the fully-formed
+        /// old value or the fully-formed new value, never a torn one -- mirrors the existing
+        /// <see cref="completedTotal"/> volatile-read pattern in this file.
+        /// </summary>
+        private UploadBlockState currentBlock = UploadBlockState.None;
+
+        /// <inheritdoc />
+        public UploadBlockState CurrentBlock => System.Threading.Volatile.Read(ref currentBlock);
+
+        /// <summary>
+        /// Job PeekAsync must return first (ahead of the normal drain order), set by
+        /// <see cref="ClearBlockAsync"/>. Only ever read/written under <see cref="semaphore"/> (both
+        /// call sites already hold it), so no separate volatile access is needed.
+        /// </summary>
+        private Guid? resumePriorityJobId;
+
+        /// <summary>
+        /// Per-installation random salt for <see cref="ComputeIdentityFingerprintAsync"/>'s HMAC-SHA256,
+        /// persisted inside the SAME DPAPI-encrypted envelope as the queue (never a bare digest of the
+        /// key -- storage-quota plan §4 Step 2, point 4). Lazily generated on first use; only ever
+        /// read/written under <see cref="semaphore"/>.
+        /// </summary>
+        private byte[] identitySalt;
 
         /// <summary>
         /// Creates a new queue repository with the specified data folder.
@@ -224,6 +258,21 @@ namespace Astrovault.Data
             try
             {
                 var now = DateTime.UtcNow;
+
+                // Storage-quota plan §4 Step 2, point 3: a job pinned by ClearBlockAsync is attempted
+                // FIRST, ahead of the normal drain order -- the resume probe costs exactly one request.
+                // If the pinned job isn't (or is no longer) a due Pending job -- completed, dismissed,
+                // still in backoff -- fall through to the normal order without clearing the pin; only
+                // an explicit new SetBlockAsync/ClearBlockAsync commit changes it.
+                if (resumePriorityJobId.HasValue)
+                {
+                    var pinned = jobs.FirstOrDefault(j => j.Id == resumePriorityJobId.Value && IsDuePending(j, now));
+                    if (pinned != null)
+                    {
+                        return pinned;
+                    }
+                }
+
                 // REL-07: skip jobs whose NextRetryAfter is still in the future (non-blocking backoff).
                 return OrderPendingByDrainOrder(
                         jobs.Where(j => IsDuePending(j, now)))
@@ -652,6 +701,287 @@ namespace Astrovault.Data
             }
         }
 
+        // ====================================================================
+        // Blocked-state machine (storage-quota plan §4 Step 2)
+        // ====================================================================
+
+        /// <inheritdoc />
+        public async Task<bool> SetBlockAsync(UploadBlockKind kind, Guid failedJobId, UploadBlockSnapshot snapshot, UploadBlockIdentityInput identity)
+        {
+            await semaphore.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                // Return the failing job to Pending -- never Failed, nothing discarded, QueuedAt
+                // untouched. No retry is scheduled (this is NOT a transient failure) and the job's
+                // ErrorMessage/LastFailureReason are left as-is (no user-facing notification path
+                // exists yet for a blocked job -- Step 3).
+                var job = jobs.FirstOrDefault(j => j.Id == failedJobId);
+                if (job != null)
+                {
+                    job.Status = UploadStatus.Pending;
+                    job.NextRetryAfter = null;
+                }
+
+                var fingerprint = ComputeFingerprintLocked(identity?.ApiKey);
+
+                currentBlock = new UploadBlockState
+                {
+                    Kind = kind,
+                    Snapshot = new UploadBlockSnapshot
+                    {
+                        UsedBytes = snapshot?.UsedBytes,
+                        LimitBytes = snapshot?.LimitBytes,
+                        Flavor = snapshot?.Flavor ?? QuotaBlockFlavor.StorageLimitExceeded,
+                        TimestampUtc = DateTime.UtcNow
+                    },
+                    Identity = new UploadBlockIdentity
+                    {
+                        EndpointUrl = identity?.EndpointUrl,
+                        AccountId = identity?.AccountId,
+                        KeyFingerprint = fingerprint
+                    },
+                    // Storage-quota plan §4 Step 5: persisted so ResumeAsync can pin the SAME job even
+                    // after a NINA restart (a fresh UploadManager has no in-memory record of it).
+                    FailedJobId = failedJobId
+                };
+                // Entering a NEW block clears any stale pin left over from a previous latch/resume cycle.
+                resumePriorityJobId = null;
+
+                var committed = await SaveQueueToDiskAsync().ConfigureAwait(false);
+                if (committed)
+                {
+                    Logger.Warning($"[Queue] Block set: {kind} (job {failedJobId} returned to Pending)");
+                }
+                else
+                {
+                    Logger.Error($"[Queue] Block set ({kind}) but FAILED to persist durably -- in-memory state only");
+                }
+                return committed;
+            }
+            finally
+            {
+                semaphore.Release();
+            }
+        }
+
+        /// <inheritdoc />
+        public async Task<bool> ClearBlockAsync(Guid? resumePriorityJobId)
+        {
+            await semaphore.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                // Storage-quota plan directive C (the durability-latch P0): capture the pre-attempt
+                // state BEFORE mutating so a failed commit can be rolled back. The old code mutated
+                // currentBlock/resumePriorityJobId THEN attempted the commit -- on failure it returned
+                // false but left the in-memory CurrentBlock already cleared, releasing the durability
+                // latch (any reader of CurrentBlock, and a second ClearBlockAsync attempt's own
+                // "previous state" capture, would both observe a clear that never reached disk).
+                var previousBlock = currentBlock;
+                var previousPin = this.resumePriorityJobId;
+
+                currentBlock = UploadBlockState.None;
+                this.resumePriorityJobId = resumePriorityJobId;
+
+                var committed = await SaveQueueToDiskAsync().ConfigureAwait(false);
+                var pinDesc = resumePriorityJobId.HasValue ? resumePriorityJobId.Value.ToString() : "none";
+                if (committed)
+                {
+                    Logger.Info($"[Queue] Block cleared (resume priority job: {pinDesc})");
+                }
+                else
+                {
+                    // Fail-safe: restore BOTH fields to their pre-attempt values -- a failed commit must
+                    // never release the durability latch. CurrentBlock keeps reflecting reality (still
+                    // blocked, no new pin) until a commit actually succeeds.
+                    currentBlock = previousBlock;
+                    this.resumePriorityJobId = previousPin;
+                    Logger.Error($"[Queue] Block clear requested (resume priority job: {pinDesc}) but FAILED to persist durably -- retaining the previous block state");
+                }
+                return committed;
+            }
+            finally
+            {
+                semaphore.Release();
+            }
+        }
+
+        /// <inheritdoc />
+        public async Task<bool> ResetJobToPendingIfInProgressAsync(Guid jobId)
+        {
+            await semaphore.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                var job = jobs.FirstOrDefault(j => j.Id == jobId);
+                if (job == null || job.Status != UploadStatus.InProgress)
+                {
+                    return true; // nothing to reset -- trivially successful no-op
+                }
+
+                job.Status = UploadStatus.Pending;
+                // D-verdict fix (item 1): the in-memory reset stays regardless of what happens below --
+                // Pending is the safe direction, and a fresh disk load reconverts InProgress -> Pending
+                // anyway -- but the SaveQueueToDiskAsync result must no longer be discarded. Log honestly
+                // (a warning, never a claimed success) and propagate it so the caller/tests can observe
+                // whether the reset actually reached disk.
+                var committed = await SaveQueueToDiskAsync().ConfigureAwait(false);
+                if (committed)
+                {
+                    Logger.Info($"[Queue] Job {jobId} cleanly cancelled -- reset InProgress -> Pending");
+                }
+                else
+                {
+                    Logger.Warning($"[Queue] Job {jobId} reset InProgress -> Pending in memory, but FAILED to persist durably -- a fresh disk load will still recover the correct state");
+                }
+                return committed;
+            }
+            finally
+            {
+                semaphore.Release();
+            }
+        }
+
+        /// <inheritdoc />
+        public async Task<int> ResetAllInProgressToPendingAsync()
+        {
+            await semaphore.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                var affected = jobs.Where(j => j.Status == UploadStatus.InProgress).ToList();
+                foreach (var job in affected)
+                {
+                    job.Status = UploadStatus.Pending;
+                }
+
+                if (affected.Count > 0)
+                {
+                    // D-verdict fix (item 1): stop discarding SaveQueueToDiskAsync's result -- the
+                    // in-memory reset stays regardless (Pending is the safe direction, and reload
+                    // reconverts anyway), but a failed persist must be logged as a warning, never as
+                    // success.
+                    var committed = await SaveQueueToDiskAsync().ConfigureAwait(false);
+                    if (committed)
+                    {
+                        Logger.Info($"[Queue] Reset {affected.Count} InProgress job(s) to Pending (same-process restart defensive reset)");
+                    }
+                    else
+                    {
+                        Logger.Warning($"[Queue] Reset {affected.Count} InProgress job(s) to Pending in memory, but FAILED to persist durably -- a fresh disk load will still recover the correct state");
+                    }
+                }
+
+                return affected.Count;
+            }
+            finally
+            {
+                semaphore.Release();
+            }
+        }
+
+        /// <inheritdoc />
+        public async Task<bool> UpgradeBlockAccountIdAsync(string accountId)
+        {
+            await semaphore.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                if (currentBlock.Kind == UploadBlockKind.None || currentBlock.Identity == null)
+                {
+                    return true; // nothing latched (or no identity to upgrade) -- treat as a no-op success
+                }
+
+                var previousBlock = currentBlock;
+                currentBlock = new UploadBlockState
+                {
+                    Kind = previousBlock.Kind,
+                    Snapshot = previousBlock.Snapshot,
+                    Identity = new UploadBlockIdentity
+                    {
+                        EndpointUrl = previousBlock.Identity.EndpointUrl,
+                        AccountId = accountId,
+                        KeyFingerprint = previousBlock.Identity.KeyFingerprint
+                    },
+                    FailedJobId = previousBlock.FailedJobId
+                };
+
+                var committed = await SaveQueueToDiskAsync().ConfigureAwait(false);
+                if (committed)
+                {
+                    Logger.Info("[Queue] Live block upgraded with a newly-known accountId");
+                }
+                else
+                {
+                    // Fail-safe: roll back -- never claim a durability that did not happen.
+                    currentBlock = previousBlock;
+                    Logger.Error("[Queue] Block accountId upgrade FAILED to persist durably -- retaining the previous identity");
+                }
+                return committed;
+            }
+            finally
+            {
+                semaphore.Release();
+            }
+        }
+
+        /// <inheritdoc />
+        public async Task<string> ComputeIdentityFingerprintAsync(string apiKey)
+        {
+            if (string.IsNullOrEmpty(apiKey))
+            {
+                return null;
+            }
+
+            await semaphore.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                var isNewSalt = identitySalt == null;
+                var fingerprint = ComputeFingerprintLocked(apiKey);
+                if (isNewSalt)
+                {
+                    // Persist the freshly-generated salt immediately -- otherwise a later fingerprint
+                    // computation (e.g. after a restart, before any block was ever set) would regenerate
+                    // a DIFFERENT salt and silently make every future identity comparison "foreign".
+                    await SaveQueueToDiskAsync().ConfigureAwait(false);
+                }
+                return fingerprint;
+            }
+            finally
+            {
+                semaphore.Release();
+            }
+        }
+
+        /// <summary>
+        /// Computes the salted HMAC-SHA256 fingerprint of <paramref name="apiKey"/>, lazily generating
+        /// the per-installation salt on first use. MUST be called only while already holding
+        /// <see cref="semaphore"/> (both call sites -- <see cref="SetBlockAsync"/> and
+        /// <see cref="ComputeIdentityFingerprintAsync"/> -- hold it). Returns null for a null/empty key.
+        /// </summary>
+        private string ComputeFingerprintLocked(string apiKey)
+        {
+            if (string.IsNullOrEmpty(apiKey))
+            {
+                return null;
+            }
+
+            if (identitySalt == null)
+            {
+                identitySalt = RandomNumberGenerator.GetBytes(32);
+            }
+
+            using var hmac = new HMACSHA256(identitySalt);
+            var hash = hmac.ComputeHash(Encoding.UTF8.GetBytes(apiKey));
+            return Convert.ToBase64String(hash);
+        }
+
+        /// <summary>
+        /// Storage-quota plan directive I (B#10 test-hardening): test-only (InternalsVisibleTo
+        /// CloudUploadPlugin.Tests) read of the current per-installation identity salt, exposed with the
+        /// NARROWEST possible surface (mirrors <see cref="DpapiEntropyForTests"/>'s pattern) so a test can
+        /// independently recompute the expected HMAC-SHA256 and pin the actual security contract
+        /// (keyed/salted, not a bare digest) instead of only asserting non-emptiness/non-equality-to-the-
+        /// raw-key. Null before the salt has ever been lazily generated (no fingerprint computed yet).
+        /// </summary>
+        internal byte[] IdentitySaltForTests => identitySalt;
+
         /// <summary>
         /// Loads and decrypts the queue from disk on startup.
         /// Cleans up any stale .tmp files left from interrupted atomic saves.
@@ -676,7 +1006,12 @@ namespace Astrovault.Data
             {
                 var encryptedBytes = File.ReadAllBytes(queueFilePath);
                 var json = DecryptData(encryptedBytes, out var wasLegacyNullEntropy);
-                jobs = DeserializeJobs(json, out var persistedCompletedTotal) ?? new List<UploadJob>();
+                jobs = DeserializeJobs(
+                    json,
+                    out var persistedCompletedTotal,
+                    out var persistedBlock,
+                    out var persistedResumePriorityJobId,
+                    out var persistedIdentitySalt) ?? new List<UploadJob>();
 
                 // Seed the lifetime running total. v2 files carry the persisted value; pre-v2 files
                 // (sentinel -1) seed from the retained completed-job count so the counter continues
@@ -686,6 +1021,12 @@ namespace Astrovault.Data
                 completedTotal = persistedCompletedTotal < 0
                     ? retainedCompleted
                     : Math.Max(persistedCompletedTotal, retainedCompleted);
+
+                // v3 additive fields (storage-quota plan §4 Step 2) -- absent on v1/v2 files, in which
+                // case DeserializeJobs already defaulted them to "not blocked" / no pin / no salt.
+                currentBlock = persistedBlock ?? UploadBlockState.None;
+                resumePriorityJobId = persistedResumePriorityJobId;
+                identitySalt = persistedIdentitySalt;
 
                 // Reset any InProgress jobs to Pending (interrupted by shutdown)
                 foreach (var job in jobs.Where(j => j.Status == UploadStatus.InProgress))
@@ -761,8 +1102,13 @@ namespace Astrovault.Data
         /// disk (fsync) BEFORE the atomic rename, so a power loss between write and rename cannot
         /// leave a zeroed/partial queue.dat. A .bak of the previous good queue is preserved as a
         /// rollback artifact, and any .corrupt-&lt;ts&gt; quarantine is never touched.
+        /// Returns whether the commit durably succeeded (storage-quota plan §4 Step 2: SetBlockAsync /
+        /// ClearBlockAsync / ComputeIdentityFingerprintAsync observe this to report a fail-safe
+        /// "not durable" outcome instead of claiming persistence that did not happen). Pre-existing call
+        /// sites that predate this change simply await the call as a statement and discard the result,
+        /// preserving their exact original (best-effort, log-only-on-failure) behavior.
         /// </summary>
-        private async Task SaveQueueToDiskAsync()
+        private async Task<bool> SaveQueueToDiskAsync()
         {
             byte[] encryptedBytes;
             try
@@ -773,7 +1119,7 @@ namespace Astrovault.Data
             catch (Exception ex)
             {
                 Logger.Error($"[Queue] Failed to serialize queue: {ex.Message}");
-                return;
+                return false;
             }
 
             // Durable write to .tmp (fsync before close).
@@ -790,10 +1136,10 @@ namespace Astrovault.Data
             catch (Exception ex)
             {
                 Logger.Error($"[Queue] Failed to write queue tmp: {ex.Message}");
-                return;
+                return false;
             }
 
-            await Task.Run(() => CommitTmpToQueue(tmpPath)).ConfigureAwait(false);
+            return await Task.Run(() => CommitTmpToQueue(tmpPath)).ConfigureAwait(false);
         }
 
         /// <summary>
@@ -835,8 +1181,9 @@ namespace Astrovault.Data
         /// Promotes a fully-flushed queue.dat.tmp to queue.dat: snapshots the previous good queue.dat
         /// to queue.dat.bak (rollback artifact), then atomically renames .tmp -> queue.dat. Quarantine
         /// (.corrupt-&lt;ts&gt;) files have distinct names and are never affected.
+        /// Returns true only when the rename onto queue.dat actually succeeded.
         /// </summary>
-        private void CommitTmpToQueue(string tmpPath)
+        private bool CommitTmpToQueue(string tmpPath)
         {
             try
             {
@@ -852,6 +1199,7 @@ namespace Astrovault.Data
                 try
                 {
                     File.Move(tmpPath, queueFilePath, overwrite: true);
+                    return true;
                 }
                 catch (IOException)
                 {
@@ -860,17 +1208,20 @@ namespace Astrovault.Data
                     try
                     {
                         File.Move(tmpPath, queueFilePath, overwrite: true);
+                        return true;
                     }
                     catch (IOException retryEx)
                     {
                         Logger.Warning($"[Queue] Atomic rename failed after retry: {retryEx.Message}");
                         // Original queue.dat remains intact
+                        return false;
                     }
                 }
             }
             catch (Exception ex)
             {
                 Logger.Error($"[Queue] Failed to commit queue: {ex.Message}");
+                return false;
             }
         }
 
@@ -915,7 +1266,19 @@ namespace Astrovault.Data
             {
                 ["SchemaVersion"] = CurrentSchemaVersion,
                 ["CompletedTotal"] = completedTotal,
-                ["Jobs"] = jobsArray
+                ["Jobs"] = jobsArray,
+                // v3 additive fields (storage-quota plan §4 Step 2). Block is omitted (null) when not
+                // blocked -- keeps the common (never-blocked) on-disk shape unchanged from v2 aside from
+                // these three explicit-null/absent-equivalent keys.
+                ["Block"] = currentBlock.Kind == UploadBlockKind.None
+                    ? null
+                    : JObject.FromObject(currentBlock, serializer),
+                ["ResumePriorityJobId"] = resumePriorityJobId.HasValue
+                    ? (JToken)resumePriorityJobId.Value.ToString()
+                    : JValue.CreateNull(),
+                ["IdentitySalt"] = identitySalt != null
+                    ? (JToken)Convert.ToBase64String(identitySalt)
+                    : JValue.CreateNull()
             };
             return envelopeObj.ToString(Formatting.None);
         }
@@ -925,22 +1288,63 @@ namespace Astrovault.Data
         /// the legacy bare-array format (auto-migrated on the next save). Unknown/removed status names
         /// fall back tolerantly to Pending so a single bad value never corrupts adjacent jobs.
         /// Returns null only when the JSON is structurally unusable (caller treats that as corruption).
+        /// <paramref name="block"/>/<paramref name="resumePriorityJobId"/>/<paramref name="identitySalt"/>
+        /// are v3 additive fields (storage-quota plan §4 Step 2, point 2): absent on v1/v2 files, in
+        /// which case they default to "not blocked" / no pin / no salt -- a v2 file loads exactly as it
+        /// did before this change.
         /// </summary>
-        private static List<UploadJob> DeserializeJobs(string json, out int completedTotal)
+        private static List<UploadJob> DeserializeJobs(
+            string json,
+            out int completedTotal,
+            out UploadBlockState block,
+            out Guid? resumePriorityJobId,
+            out byte[] identitySalt)
         {
             // -1 sentinel = "absent" (pre-v2 file). The caller seeds the running total from the
             // retained completed-job count in that case so the counter continues from current state.
             completedTotal = -1;
+            block = UploadBlockState.None;
+            resumePriorityJobId = null;
+            identitySalt = null;
             var root = JToken.Parse(json);
 
             JToken jobsToken;
             if (root.Type == JTokenType.Object)
             {
-                // v1/v2 envelope: { "SchemaVersion": N, "CompletedTotal"?: M, "Jobs": [...] }
+                // v1/v2/v3 envelope: { "SchemaVersion": N, "CompletedTotal"?: M, "Jobs": [...],
+                // "Block"?: {...}, "ResumePriorityJobId"?: "guid", "IdentitySalt"?: "base64" }
                 jobsToken = root["Jobs"] ?? new JArray();
                 if (root["CompletedTotal"] is JValue ctVal && ctVal.Type == JTokenType.Integer)
                 {
                     completedTotal = ctVal.Value<int>();
+                }
+
+                if (root["Block"] is JObject blockObj)
+                {
+                    block = ParseBlock(blockObj);
+                }
+
+                if (root["ResumePriorityJobId"] is JValue pinVal
+                    && pinVal.Type == JTokenType.String
+                    && Guid.TryParse(pinVal.Value<string>(), out var pinnedId))
+                {
+                    resumePriorityJobId = pinnedId;
+                }
+
+                if (root["IdentitySalt"] is JValue saltVal && saltVal.Type == JTokenType.String)
+                {
+                    try
+                    {
+                        identitySalt = Convert.FromBase64String(saltVal.Value<string>());
+                    }
+                    catch (FormatException)
+                    {
+                        // Corrupt salt -- treated as absent; a fresh salt is generated and persisted on
+                        // next use. This orphans any EXISTING block's fingerprint comparison (it will
+                        // read as "foreign" and clear), which is the safe failure mode.
+                        Logger.Warning("[Queue] Persisted identity salt was malformed -- will regenerate on next use");
+                        identitySalt = null;
+                    }
                 }
             }
             else if (root.Type == JTokenType.Array)
@@ -991,6 +1395,98 @@ namespace Astrovault.Data
 
             return jobsToken.ToObject<List<UploadJob>>(JsonSerializer.Create(QueueJsonSettings))
                    ?? new List<UploadJob>();
+        }
+
+        /// <summary>
+        /// Parses the persisted "Block" sub-object into an <see cref="UploadBlockState"/>. Never throws
+        /// out to the caller -- a malformed Block object (unknown/missing Kind, corrupt sub-object) falls
+        /// back to <see cref="UploadBlockState.None"/> so the WHOLE queue load still succeeds; only the
+        /// block restoration is lost, which is a safer failure mode than refusing to load pending jobs.
+        /// </summary>
+        private static UploadBlockState ParseBlock(JObject blockObj)
+        {
+            try
+            {
+                var kindToken = blockObj["Kind"];
+                var kindName = kindToken?.Type == JTokenType.String ? kindToken.Value<string>() : null;
+
+                if (kindName == null || !Enum.TryParse<UploadBlockKind>(kindName, out var kind)
+                    || !Enum.IsDefined(typeof(UploadBlockKind), kind))
+                {
+                    if (kindName != null)
+                    {
+                        Logger.Warning($"[Queue] Unknown/removed block kind '{kindName}' -> treating as no block");
+                    }
+                    return UploadBlockState.None;
+                }
+
+                if (kind == UploadBlockKind.None)
+                {
+                    return UploadBlockState.None;
+                }
+
+                var snapshotObj = blockObj["Snapshot"] as JObject;
+                var identityObj = blockObj["Identity"] as JObject;
+
+                // Storage-quota plan §4 Step 5: additive field -- absent on a pre-Step-5 v3 file, in
+                // which case it stays null and resume falls back to no pin (normal drain order).
+                Guid? failedJobId = null;
+                if (blockObj["FailedJobId"] is JValue failedJobIdVal
+                    && failedJobIdVal.Type == JTokenType.String
+                    && Guid.TryParse(failedJobIdVal.Value<string>(), out var parsedFailedJobId))
+                {
+                    failedJobId = parsedFailedJobId;
+                }
+
+                // Pass H P1: the Flavor enum must be normalized BEFORE ToObject -- an unknown string
+                // (a future additive flavor, or a downgrade reading a newer file) would make ToObject
+                // throw, and the catch below would convert the WHOLE block to None, releasing the
+                // stop-queue latch. Unknown values must degrade to the default flavor, never unlatch.
+                if (snapshotObj?["Flavor"] is JToken flavorToken)
+                {
+                    // Pass I: normalization must be TOTAL. Value<long>() itself throws on a JSON
+                    // integer beyond Int64 (BigInteger), and an unchecked long->int cast wraps
+                    // (4294967297 -> 1 -> PlanRequired). Any token this cannot decode safely --
+                    // including its own decode throwing -- degrades to the default flavor; it must
+                    // never reach the outer catch-all that would drop the whole block (unlatch).
+                    var normalized = QuotaBlockFlavor.StorageLimitExceeded;
+                    try
+                    {
+                        if (flavorToken.Type == JTokenType.String
+                            && Enum.TryParse<QuotaBlockFlavor>(flavorToken.Value<string>(), ignoreCase: false, out var parsedFlavor)
+                            && Enum.IsDefined(typeof(QuotaBlockFlavor), parsedFlavor))
+                        {
+                            normalized = parsedFlavor;
+                        }
+                        else if (flavorToken.Type == JTokenType.Integer)
+                        {
+                            var raw = flavorToken.Value<long>();
+                            if (raw >= 0 && raw <= int.MaxValue && Enum.IsDefined(typeof(QuotaBlockFlavor), (int)raw))
+                            {
+                                normalized = (QuotaBlockFlavor)(int)raw;
+                            }
+                        }
+                    }
+                    catch
+                    {
+                        // Undecodable token (e.g. BigInteger overflow) -> keep the default flavor.
+                    }
+                    snapshotObj["Flavor"] = normalized.ToString();
+                }
+
+                return new UploadBlockState
+                {
+                    Kind = kind,
+                    Snapshot = snapshotObj?.ToObject<UploadBlockSnapshot>(),
+                    Identity = identityObj?.ToObject<UploadBlockIdentity>(),
+                    FailedJobId = failedJobId
+                };
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"[Queue] Failed to parse persisted block state -> treating as no block: {ex.Message}");
+                return UploadBlockState.None;
+            }
         }
 
         // ====================================================================

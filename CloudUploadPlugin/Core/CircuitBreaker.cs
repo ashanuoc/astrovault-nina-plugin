@@ -79,6 +79,20 @@ namespace Astrovault.Core
         }
 
         /// <summary>
+        /// Storage-quota plan §4 Step 2 (point 5): a 507 (quota) or 401/403 (auth) HTTP response still
+        /// PROVES connectivity to the server -- the request round-tripped; only the semantic outcome
+        /// was a block, not a network fault or 5xx. Resets the consecutive-failure count and closes a
+        /// Half-Open probe -- the SAME transition <see cref="RecordSuccess"/> performs -- WITHOUT
+        /// pretending an upload actually succeeded. Named distinctly so call sites read intent (a
+        /// connectivity proof, not a completed upload) rather than a fake success. Callers must invoke
+        /// this BEFORE latching the queue into a block, never after.
+        /// </summary>
+        public void RecordConnectivityProof()
+        {
+            RecordSuccess();
+        }
+
+        /// <summary>
         /// Records a transient upload failure. Opens circuit after reaching threshold.
         /// Permanent failures should NOT be recorded here.
         /// </summary>

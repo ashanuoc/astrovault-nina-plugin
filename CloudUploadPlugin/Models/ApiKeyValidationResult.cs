@@ -18,6 +18,13 @@ namespace Astrovault.Models
         public string AccountName { get; set; }
 
         /// <summary>
+        /// Stable account identifier from the validate response's optional <c>accountId</c> field
+        /// (contract-delta round item 2). Null when validation fails, or when an older backend
+        /// omits the field -- tolerated, never required.
+        /// </summary>
+        public string AccountId { get; set; }
+
+        /// <summary>
         /// Error description when validation fails.
         /// Null on success.
         /// </summary>
@@ -27,8 +34,9 @@ namespace Astrovault.Models
         /// Creates a successful validation result.
         /// </summary>
         /// <param name="accountName">The account name returned by the server.</param>
-        public static ApiKeyValidationResult Success(string accountName) =>
-            new() { Valid = true, AccountName = accountName };
+        /// <param name="accountId">The account id returned by the server, or null when absent (older backend).</param>
+        public static ApiKeyValidationResult Success(string accountName, string accountId = null) =>
+            new() { Valid = true, AccountName = accountName, AccountId = accountId };
 
         /// <summary>
         /// Creates a failed validation result.
